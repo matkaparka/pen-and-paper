@@ -1,0 +1,25 @@
+# 本地分析产物：不提交、不公开、不进入实现阶段（SAI2_PROJECT.md §1.5）
+/analysis/
+
+# 测量工具的原始采集数据（录屏、慢动作视频、输入日志）体积大且可能含目标软件画面
+/tools/**/captures/
+*.mp4
+*.mkv
+*.mov
+
+# 构建与编辑器产物
+/target/
+/build/
+/out/
+node_modules/
+.vs/
+.vscode/
+*.user
+Thumbs.db
+
+# 第三方分析/测量工具（各自官方发布包，不入库）
+/.tools/
+
+# 新软件的构建产物与验收测试的原始输出
+/src/target/
+/runs/

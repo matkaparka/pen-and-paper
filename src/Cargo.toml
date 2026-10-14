@@ -1,0 +1,16 @@
+[workspace]
+members = ["core", "app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[profile.release]
+debug = 1
+
+# 调试构建也开优化：未优化的逐像素循环慢到没法用笔试画。
+[profile.dev]
+opt-level = 2
