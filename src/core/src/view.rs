@@ -187,6 +187,9 @@ impl Display {
             })
             .collect();
         let (w, h) = (doc.width, doc.height);
+        // 画布外接矩形之外只能是底色，不必为每个屏幕像素做最多 16 次采样。
+        // screen_bounds 已向外留边，包含像素内的全部抗锯齿采样点。
+        let canvas_screen = view.screen_bounds(doc.bounds(), vp).intersect(rect);
         let cache = &self.cache;
         let taps = &taps;
         // 画其中的一段屏幕行。`rows` 是窗口缓冲里从第 `first` 行（视口内坐标）开始的若干整行。
@@ -210,10 +213,19 @@ impl Display {
             };
             for (k, line) in rows.chunks_mut(stride).enumerate() {
                 let sy = first + k as i32;
-                let start = view.to_canvas((rect.x0 as f32 + 0.5, sy as f32 + 0.5), vp);
                 let at = (origin.0 + rect.x0) as usize;
                 let row = &mut line[at..at + (rect.x1 - rect.x0) as usize];
-                for (i, out) in row.iter_mut().enumerate() {
+                if canvas_screen.is_empty() || sy < canvas_screen.y0 || sy >= canvas_screen.y1 {
+                    row.fill(PASTEBOARD);
+                    continue;
+                }
+                let start = view.to_canvas((rect.x0 as f32 + 0.5, sy as f32 + 0.5), vp);
+                let left = (canvas_screen.x0 - rect.x0) as usize;
+                let right = (canvas_screen.x1 - rect.x0) as usize;
+                row[..left].fill(PASTEBOARD);
+                row[right..].fill(PASTEBOARD);
+                // 先编号再裁剪，保留相对 rect.x0 的坐标和原来的浮点舍入。
+                for (i, out) in row.iter_mut().enumerate().take(right).skip(left) {
                     let (bx, by) = (start.0 + inv[0] * i as f32, start.1 + inv[2] * i as f32);
                     if n == 1 {
                         *out = fetch(bx, by);
@@ -236,16 +248,28 @@ impl Display {
         let from = (origin.1 + rect.y0) as usize * stride;
         let end = (from + lines * stride).min(buf.len());
         let area = &mut buf[from..end];
-        if (rect.x1 - rect.x0) as i64 * lines as i64 * (n * n) as i64 >= PARALLEL_PIXELS {
-            let per = lines.div_ceil(workers());
-            let paint = &paint;
-            std::thread::scope(|scope| {
-                for (j, part) in area.chunks_mut(per * stride).enumerate() {
-                    scope.spawn(move || paint(rect.y0 + (j * per) as i32, part));
-                }
-            });
-        } else {
+        if canvas_screen.is_empty() {
             paint(rect.y0, area);
+        } else {
+            // 上下纯底色的行直接填好；只把有采样工作的行平分，缩小时不让一半线程闲着。
+            let top = (canvas_screen.y0 - rect.y0) as usize * stride;
+            let (above, rest) = area.split_at_mut(top.min(area.len()));
+            paint(rect.y0, above);
+            let lines = (canvas_screen.y1 - canvas_screen.y0) as usize;
+            let (inside, below) = rest.split_at_mut((lines * stride).min(rest.len()));
+            paint(canvas_screen.y1, below);
+            let samples = (canvas_screen.x1 - canvas_screen.x0) as i64 * lines as i64 * (n * n) as i64;
+            if samples >= PARALLEL_PIXELS {
+                let per = lines.div_ceil(workers());
+                let paint = &paint;
+                std::thread::scope(|scope| {
+                    for (j, part) in inside.chunks_mut(per * stride).enumerate() {
+                        scope.spawn(move || paint(canvas_screen.y0 + (j * per) as i32, part));
+                    }
+                });
+            } else {
+                paint(canvas_screen.y0, inside);
+            }
         }
 
         if let (Some(sel), false) = (doc.selection(), self.hide_selection) {
@@ -365,6 +389,49 @@ mod tests {
         assert_eq!(buf[(49 * 300 + 150) as usize], 0x0012_3456);
     }
 
+    /// 跳过画布外的采样后，缩放、翻转、旋转和局部重画仍与逐点采样一致。
+    #[test]
+    fn pasteboard_clipping_preserves_edge_samples() {
+        let mut doc = Document::new(67, 49);
+        doc.fill_active([13, 71, 206]);
+        let vp = (81, 67);
+        let (stride, origin) = (103usize, (7, 11));
+        let sentinel = 0x0012_3456;
+        for zoom in [0.02, 0.25, 0.5, 1.0, 2.0] {
+            for angle in [0.0f32, 0.4, std::f32::consts::FRAC_PI_2] {
+                for (flip, center) in [(false, (33.5, 24.5)), (true, (-20.3, 55.7)), (false, (5000.0, 5000.0))] {
+                    let v = View { zoom, angle, flip, center };
+                    let inv = v.inverse();
+                    let n = if zoom < 0.999 { ((1.0 / zoom).ceil() as i32).clamp(2, 4) } else if angle.sin().abs() > 1e-4 && angle.cos().abs() > 1e-4 { 2 } else { 1 };
+                    for rect in [Rect { x0: 0, y0: 0, x1: vp.0, y1: vp.1 }, Rect { x0: 13, y0: 7, x1: 70, y1: 53 }] {
+                        let mut expected = vec![sentinel; stride * 89];
+                        for sy in rect.y0..rect.y1 {
+                            let start = v.to_canvas((rect.x0 as f32 + 0.5, sy as f32 + 0.5), vp);
+                            for sx in rect.x0..rect.x1 {
+                                let i = (sx - rect.x0) as f32;
+                                let (bx, by) = (start.0 + inv[0] * i, start.1 + inv[2] * i);
+                                let mut rgb = [0; 3];
+                                for k in 0..n * n {
+                                    let (ox, oy) = (((k % n) as f32 + 0.5) / n as f32 - 0.5, ((k / n) as f32 + 0.5) / n as f32 - 0.5);
+                                    let (cx, cy) = ((bx + (inv[0] * ox + inv[1] * oy)).floor() as i32, (by + (inv[2] * ox + inv[3] * oy)).floor() as i32);
+                                    let c = if cx >= 0 && cy >= 0 && cx < doc.width && cy < doc.height { [13, 71, 206] } else { [168; 3] };
+                                    for j in 0..3 {
+                                        rgb[j] += c[j];
+                                    }
+                                }
+                                let rgb = rgb.map(|c| c / (n * n) as u32);
+                                expected[(origin.1 + sy) as usize * stride + (origin.0 + sx) as usize] = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+                            }
+                        }
+                        let mut actual = vec![sentinel; expected.len()];
+                        Display::default().render(&doc, None, &v, vp, &mut actual, stride, origin, rect);
+                        assert!(actual == expected, "view {v:?}, rect {rect:?}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn thin_lines_survive_zooming_out() {
         use crate::stabilizer::Sample;
@@ -424,14 +491,18 @@ mod tests {
         }
         // 同一个视图，一次整张画（够大，会分给几个线程），一次切成很多横条画（每条都小，在当前线程上画）。
         // 横条和整张的左边界相同，所以每一行的浮点运算一模一样，结果应当逐像素相同。
-        for v in [View { zoom: 1.0, angle: 0.0, flip: false, center: (800.0, 600.0) }, View { zoom: 0.6, angle: 0.4, flip: true, center: (700.0, 650.0) }] {
+        for v in [
+            View { zoom: 1.0, angle: 0.0, flip: false, center: (800.0, 600.0) },
+            View { zoom: 0.6, angle: 0.4, flip: true, center: (700.0, 650.0) },
+            View { zoom: 0.25, angle: 0.0, flip: false, center: (800.0, 600.0) },
+        ] {
             let (vw, vh) = (1400usize, 1000usize);
             let (mut whole, mut pieces) = (vec![0u32; vw * vh], vec![0u32; vw * vh]);
             let vp = (vw as i32, vh as i32);
             Display::default().render(&doc, None, &v, vp, &mut whole, vw, (0, 0), Rect { x0: 0, y0: 0, x1: vp.0, y1: vp.1 });
             let mut d = Display::default();
-            for y in (0..vp.1).step_by(50) {
-                d.render(&doc, None, &v, vp, &mut pieces, vw, (0, 0), Rect { x0: 0, y0: y, x1: vp.0, y1: y + 50 });
+            for y in (0..vp.1).step_by(10) {
+                d.render(&doc, None, &v, vp, &mut pieces, vw, (0, 0), Rect { x0: 0, y0: y, x1: vp.0, y1: y + 10 });
             }
             assert!(whole == pieces);
         }
@@ -444,6 +515,42 @@ mod timing {
     use crate::stabilizer::Sample;
     use crate::stroke::{BrushParams, Stroke};
     use std::time::Instant;
+
+    /// 已合成缓存的全视口重绘；校验和用于比较构建/实现前后的实际像素。
+    #[test]
+    #[ignore]
+    fn viewport_timing() {
+        use std::hint::black_box;
+        let mut doc = Document::new(3000, 2000);
+        doc.fill_active([35, 80, 140]);
+        for k in 0..12 {
+            let (mut stroke, _) = Stroke::begin(
+                BrushParams { size: 30.0, color: [20 * k as u8, 90, 200], ..Default::default() },
+                0,
+                Sample { x: 100.0, y: 50.0 + 150.0 * k as f32, p: 1.0 },
+            );
+            stroke.add(Sample { x: 2800.0, y: 180.0 + 150.0 * k as f32, p: 0.3 });
+            stroke.end();
+            doc.commit_stroke(&stroke);
+        }
+        let vp = (1920, 1080);
+        let rect = Rect { x0: 0, y0: 0, x1: vp.0, y1: vp.1 };
+        let mut buf = vec![0; (vp.0 * vp.1) as usize];
+        for (zoom, angle) in [(1.0, 0.0), (0.5, 0.0), (0.25, 0.0), (1.0, 0.4), (0.5, 0.4)] {
+            let view = View { zoom, angle, flip: false, center: (1500.0, 1000.0) };
+            let mut display = Display::default();
+            display.render(&doc, None, &view, vp, &mut buf, vp.0 as usize, (0, 0), rect);
+            let mut times = Vec::new();
+            for _ in 0..21 {
+                let start = Instant::now();
+                display.render(&doc, None, &view, vp, black_box(&mut buf), vp.0 as usize, (0, 0), rect);
+                times.push(start.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(f64::total_cmp);
+            let checksum = buf.iter().fold(0xcbf29ce484222325u64, |h, &p| (h ^ p as u64).wrapping_mul(0x100000001b3));
+            println!("zoom {zoom:<4} angle {angle:<3}: median {:.3} ms, checksum {checksum:016x}", times[times.len() / 2]);
+        }
+    }
 
     /// 大笔刷每来一个样本要花多久：笔画引擎、合成、显示各占多少。平时不跑：
     /// `cargo test --release -p zhibi-core big_brush_timing -- --ignored --nocapture`

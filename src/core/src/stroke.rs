@@ -237,11 +237,19 @@ fn capsule(mask: &mut MaskMap, under: Option<&MaskMap>, hardness: f32, a: Node, 
         }
     };
 
-    let coords: Vec<TileCoord> = tiles_in(bounds).collect();
     let area = (bounds.x1 - bounds.x0) as i64 * (bounds.y1 - bounds.y0) as i64;
+    // 小笔段只访问这次碰到的分块，不扫描整笔的覆盖率表，也不查询系统线程数。
+    // 否则一笔走得越远，后面的每个小笔段都会花更久在与它无关的旧分块上。
+    if area < PARALLEL_PIXELS {
+        for tc in tiles_in(bounds) {
+            paint(tc, mask.get_mut(tc));
+        }
+        return bounds;
+    }
+    let coords: Vec<TileCoord> = tiles_in(bounds).collect();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
     let mut tiles = mask.many_mut(&coords);
-    if area >= PARALLEL_PIXELS && threads > 1 && tiles.len() > 1 {
+    if threads > 1 && tiles.len() > 1 {
         let per = tiles.len().div_ceil(threads);
         let paint = &paint;
         std::thread::scope(|scope| {
@@ -327,6 +335,28 @@ fn coverage(r: f32, d: f32, hardness: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 小笔刷局部补画的成本不应随同一笔已经经过的分块数增长。
+    /// `cargo test --release -p zhibi-core long_stroke_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn long_stroke_timing() {
+        use std::{hint::black_box, time::Instant};
+        for previous_tiles in [0, 512, 4096] {
+            let (mut stroke, _) = Stroke::begin(BrushParams::default(), 0, Sample { x: 50.0, y: 50.0, p: 1.0 });
+            // 已画过、但本次局部笔段不触碰的覆盖率，模拟一笔走过很大范围后继续画。
+            for k in 0..previous_tiles {
+                stroke.mask.get_mut((k % 64, 20 + k / 64)).fill(ONE as u16);
+            }
+            let start = Instant::now();
+            for k in 0..4000 {
+                let t = k as f32 * 0.05;
+                black_box(stroke.add(Sample { x: 100.0 + 50.0 * t.cos(), y: 100.0 + 50.0 * t.sin(), p: 0.8 }));
+            }
+            println!("previous tiles {previous_tiles:>4}: {:.3} us/sample", start.elapsed().as_secs_f64() * 1e6 / 4000.0);
+            black_box(&stroke);
+        }
+    }
 
     /// 沿 x = col 这一列把覆盖率加起来，得到该处的等效粗细（像素）。
     fn column_width(stroke: &Stroke, col: i32) -> f32 {
