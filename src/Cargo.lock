@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "zhibi"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "windows",
  "zhibi-core",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "zhibi-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "jpeg-encoder",
  "png",

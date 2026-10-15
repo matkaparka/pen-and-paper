@@ -296,8 +296,13 @@ impl BlendMode {
                 };
                 (v.clamp(0.0, 1.0) * ONE as f32).round() as u32
             }
+            // 两个角照参照软件（实现方案 §3.17 的注）：源是 0 时是 0（白底也是），源是 1 时是 1（黑底也是）。
             VividLight => {
-                if s * 2 <= ONE {
+                if s == 0 {
+                    0
+                } else if s >= ONE {
+                    ONE
+                } else if s * 2 <= ONE {
                     burn(b, 2 * s)
                 } else {
                     dodge(b, 2 * s - ONE)
@@ -311,8 +316,9 @@ impl BlendMode {
                     b.max(2 * s - ONE)
                 }
             }
+            // 加起来正好是 1 时：源不超过一半算 1，超过一半算 0（照参照软件，实现方案 §3.17 的注）。
             HardMix => {
-                if b + s >= ONE {
+                if b + s > ONE || (b + s == ONE && s * 2 <= ONE) {
                     ONE
                 } else {
                     0
@@ -337,9 +343,10 @@ impl BlendMode {
             BlendMode::Saturation => set_lum(set_sat(bf, sat(sf)), lum(bf)),
             BlendMode::Color => set_lum(sf, lum(bf)),
             BlendMode::Luminosity => set_lum(bf, lum(sf)),
-            // 深色、浅色：整个像素取三个分量加起来小（大）的那一个。
-            BlendMode::DarkerColor => return if s.iter().sum::<u32>() < b.iter().sum::<u32>() { s } else { b },
-            BlendMode::LighterColor => return if s.iter().sum::<u32>() > b.iter().sum::<u32>() { s } else { b },
+            // 深色、浅色：整个像素取亮度（同 `lum` 的权重）低（高）的那一个。PS 的说明里写的是"三个分量加起来"，
+            // 参照软件比的是亮度（实现方案 §3.17 的注）。
+            BlendMode::DarkerColor => return if lum15(s) < lum15(b) { s } else { b },
+            BlendMode::LighterColor => return if lum15(s) > lum15(b) { s } else { b },
             other => return [0, 1, 2].map(|c| other.mix(b[c], s[c])),
         };
         out.map(|v| (v.clamp(0.0, 1.0) * ONE as f32).round() as u32)
@@ -415,6 +422,11 @@ fn lum(c: [f32; 3]) -> f32 {
     0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
 }
 
+/// 同 `lum`，整数（放大了 100 倍），只用来比大小。
+fn lum15(c: [u32; 3]) -> u32 {
+    30 * c[0] + 59 * c[1] + 11 * c[2]
+}
+
 fn clip_color(c: [f32; 3]) -> [f32; 3] {
     let l = lum(c);
     let (n, x) = (c[0].min(c[1]).min(c[2]), c[0].max(c[1]).max(c[2]));
@@ -437,10 +449,12 @@ fn sat(c: [f32; 3]) -> f32 {
     c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
 }
 
+/// W3C 的 SetSat。三个分量一样（灰色，没有色相）时 W3C 给 0；参照软件把红当成最大的那个分量，给 (s, 0, 0)，
+/// 也就是色相按红算（实现方案 §3.17 的注）。
 fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
     let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
     if mx <= mn {
-        return [0.0; 3];
+        return [s, 0.0, 0.0];
     }
     c.map(|v| (v - mn) * s / (mx - mn))
 }
@@ -2147,6 +2161,19 @@ mod tests {
         // 深色、浅色：整个像素取一个。
         assert_eq!(DarkerColor.mix3(red, grey), red);
         assert_eq!(LighterColor.mix3(red, grey), grey);
+        // 下面几条照参照软件量出来的（实现方案 §3.17 的注）。深色、浅色比的是亮度，不是三个分量加起来：
+        // 纯蓝加起来比 0.3 的灰大，亮度却低得多。
+        let (blue, dim) = ([0, 0, ONE], [q(0.3); 3]);
+        assert_eq!((DarkerColor.mix3(dim, blue), LighterColor.mix3(blue, dim)), (blue, dim));
+        // 亮光的两个角：源是 0 时是 0（白底也是），源是 1 时是 1（黑底也是）。
+        assert_eq!((VividLight.mix(ONE, 0), VividLight.mix(0, ONE)), (0, ONE));
+        // 实色混合：加起来正好是 1 时，源不超过一半算 1，超过一半算 0；白底配 0 是 1，黑底配 1 是 0。
+        assert_eq!((HardMix.mix(ONE / 2 + 64, ONE / 2 - 64), HardMix.mix(ONE / 2 - 64, ONE / 2 + 64)), (ONE, 0));
+        assert_eq!((HardMix.mix(ONE, 0), HardMix.mix(0, ONE)), (ONE, 0));
+        // 色相：灰色的源没有色相，按红算（底的饱和度、亮度不变）。
+        let green = [q(0.2), q(0.6), q(0.2)];
+        let h = Hue.mix3(green, grey);
+        assert!(h[0] > h[1] && h[1] == h[2], "{h:?}");
         // 文件里的标识都不重复，读得回来。
         for m in BlendMode::ALL {
             assert_eq!(BlendMode::from_id(m.id()), Some(m));

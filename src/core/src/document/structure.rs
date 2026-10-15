@@ -720,9 +720,18 @@ impl Document {
     /// 只含画布里的部分。存成没有蒙版、没有填充图层的格式（ORA）时用。文件夹的蒙版这样乘进每个图层只是近似：
     /// 叠在一起的半透明部分和真的先合成再乘蒙版略有不同。
     pub fn baked_pixels(&self, i: usize) -> TileMap {
-        let layer = &self.layers[i];
         let masks: Vec<&Mask> =
             std::iter::once(i).chain(self.ancestors(i)).filter_map(|j| self.layers[j].mask.as_ref().filter(|m| !m.disabled)).collect();
+        self.pixels_with_masks(i, &masks)
+    }
+
+    /// 第 i 层的像素，填充图层画成像素（铺满画布），不乘蒙版。存成有蒙版、没有填充图层的格式（参照软件的）时用。
+    pub fn drawn_pixels(&self, i: usize) -> TileMap {
+        self.pixels_with_masks(i, &[])
+    }
+
+    fn pixels_with_masks(&self, i: usize, masks: &[&Mask]) -> TileMap {
+        let layer = &self.layers[i];
         let fill = match &layer.kind {
             Kind::Fill(f) if f.paint != Paint::Other => Some(fill_pixels(f)),
             _ => None,
@@ -751,7 +760,7 @@ impl Document {
                         (None, Some(t)) => [t.0[k * 4], t.0[k * 4 + 1], t.0[k * 4 + 2], t.0[k * 4 + 3]],
                         (None, None) => [0; 4],
                     };
-                    for m in &masks {
+                    for m in masks {
                         let v = m.tile(tc).map_or(m.default, |t| t[k]) as u32;
                         p = p.map(|c| mul15(c as u32, v) as u16);
                     }

@@ -544,6 +544,8 @@ pub struct App {
     foreign: bool,
     /// 打开的 PNG 里有透明的像素：导出时默认选"PNG（透明背景）"
     transparent_source: bool,
+    /// 上次存成参照软件的格式时说过的话：存回同一个文件、说明又一样就不再出（实现方案 §3.23）
+    told: Option<(PathBuf, Vec<String>)>,
     display: Display,
     pub view: View,
     back: Option<Backbuffer>,
@@ -2309,7 +2311,7 @@ fn tell_notes(hwnd: HWND, notes: &[String]) {
         return;
     }
     if let Some((font, scale)) = with_app(|app| (app.font, app.scale)) {
-        dialogs::notes(hwnd, font, scale, notes);
+        dialogs::notes(hwnd, font, scale, false, notes);
     }
 }
 
@@ -2328,8 +2330,8 @@ fn extension(path: &Path) -> String {
 
 fn open_filter() -> &'static str {
     tr(
-        "能打开的文件 (*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg)\0*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg\0纸笔画布 (*.zhibi)\0*.zhibi\0Photoshop 文件 (*.psd)\0*.psd\0SAI Ver.2 画布 (*.sai2，只读)\0*.sai2\0图片 (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0",
-        "Supported files (*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg)\0*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg\0Pen & Paper canvas (*.zhibi)\0*.zhibi\0Photoshop file (*.psd)\0*.psd\0SAI Ver.2 canvas (*.sai2, read only)\0*.sai2\0Images (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0",
+        "能打开的文件 (*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg)\0*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg\0纸笔画布 (*.zhibi)\0*.zhibi\0Photoshop 文件 (*.psd)\0*.psd\0SAI Ver.2 画布 (*.sai2)\0*.sai2\0图片 (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0",
+        "Supported files (*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg)\0*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg\0Pen & Paper canvas (*.zhibi)\0*.zhibi\0Photoshop file (*.psd)\0*.psd\0SAI Ver.2 canvas (*.sai2)\0*.sai2\0Images (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0",
     )
 }
 
@@ -2338,21 +2340,21 @@ fn image_filter() -> &'static str {
     tr("图片 (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0", "Images (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0")
 }
 
-/// "另存为"能选的分层格式（实现方案 §3.20），和 `save_filter` 里的顺序一样。
-const SAVE_KINDS: [&str; 3] = [format::EXTENSION, psd::EXTENSION, ora::EXTENSION];
+/// "另存为"能选的分层格式（实现方案 §3.20、§3.23），和 `save_filter` 里的顺序一样。
+const SAVE_KINDS: [&str; 4] = [format::EXTENSION, psd::EXTENSION, sai2::EXTENSION, ora::EXTENSION];
 
 fn save_filter() -> &'static str {
     tr(
-        "纸笔画布 (*.zhibi)\0*.zhibi\0Photoshop 文件 (*.psd)\0*.psd\0OpenRaster 文件 (*.ora)\0*.ora\0\0",
-        "Pen & Paper canvas (*.zhibi)\0*.zhibi\0Photoshop file (*.psd)\0*.psd\0OpenRaster file (*.ora)\0*.ora\0\0",
+        "纸笔画布 (*.zhibi)\0*.zhibi\0Photoshop 文件 (*.psd)\0*.psd\0SAI Ver.2 画布 (*.sai2)\0*.sai2\0OpenRaster 文件 (*.ora)\0*.ora\0\0",
+        "Pen & Paper canvas (*.zhibi)\0*.zhibi\0Photoshop file (*.psd)\0*.psd\0SAI Ver.2 canvas (*.sai2)\0*.sai2\0OpenRaster file (*.ora)\0*.ora\0\0",
     )
 }
 
 /// "导出"的文件类型（规格 F-143）。第 2 种是不垫背景色的 PNG。
 fn export_filter() -> &'static str {
     tr(
-        "PNG 图像 (*.png)\0*.png\0PNG 图像，透明背景 (*.png)\0*.png\0JPEG 图像 (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0Photoshop 文件 (*.psd)\0*.psd\0OpenRaster 文件 (*.ora)\0*.ora\0\0",
-        "PNG image (*.png)\0*.png\0PNG image, transparent background (*.png)\0*.png\0JPEG image (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0Photoshop file (*.psd)\0*.psd\0OpenRaster file (*.ora)\0*.ora\0\0",
+        "PNG 图像 (*.png)\0*.png\0PNG 图像，透明背景 (*.png)\0*.png\0JPEG 图像 (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0Photoshop 文件 (*.psd)\0*.psd\0SAI Ver.2 画布 (*.sai2)\0*.sai2\0OpenRaster 文件 (*.ora)\0*.ora\0\0",
+        "PNG image (*.png)\0*.png\0PNG image, transparent background (*.png)\0*.png\0JPEG image (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0Photoshop file (*.psd)\0*.psd\0SAI Ver.2 canvas (*.sai2)\0*.sai2\0OpenRaster file (*.ora)\0*.ora\0\0",
     )
 }
 
@@ -2458,6 +2460,7 @@ fn main() -> Result<()> {
                 path,
                 foreign,
                 transparent_source,
+                told: None,
                 display: Display::default(),
                 view,
                 back: None,
@@ -2643,32 +2646,41 @@ unsafe fn on_mouse(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<Later
 
 // ---- 需要自己的消息循环的操作：都在放开应用状态之后做 ----
 
-/// 存成 `path`，格式看扩展名：`.psd`、`.ora`，别的都是我们自己的格式（实现方案 §3.20）。
+/// 存成 `path`，格式看扩展名：`.psd`、`.sai2`、`.ora`，别的都是我们自己的格式（实现方案 §3.20）。
 fn save_to(hwnd: HWND, path: PathBuf) -> bool {
     let ext = extension(&path);
     if image::EXTENSIONS.contains(&ext.as_str()) {
         dialogs::message(
             hwnd,
             tr(
-                "PNG、JPEG 存不下图层，请用“文件 → 导出…”。\n“另存为”能存成纸笔画布、PSD 或 ORA。",
-                "PNG and JPEG can\u{2019}t hold layers; use File → Export… for them.\nSave As writes Pen & Paper canvas, PSD or ORA files.",
+                "PNG、JPEG 存不下图层，请用“文件 → 导出…”。\n“另存为”能存成纸笔画布、PSD、SAI Ver.2 画布或 ORA。",
+                "PNG and JPEG can\u{2019}t hold layers; use File → Export… for them.\nSave As writes Pen & Paper canvas, PSD, SAI Ver.2 canvas or ORA files.",
             ),
         );
         return false;
     }
     let result = with_app(|app| match ext.as_str() {
-        "psd" => psd::save(&app.doc, &path),
-        "ora" => ora::save(&app.doc, &path),
-        _ => format::save(&app.doc, &path),
+        "psd" => psd::save(&app.doc, &path).map(|()| Vec::new()),
+        "sai2" => sai2::save(&app.doc, &path),
+        "ora" => ora::save(&app.doc, &path).map(|()| Vec::new()),
+        _ => format::save(&app.doc, &path).map(|()| Vec::new()),
     });
     match result {
-        Some(Ok(())) => {
-            with_app(|app| {
+        Some(Ok(notes)) => {
+            // 存不下的东西说一次；存回同一个文件、说明又一样就不再出（实现方案 §3.23）。
+            let told = (path.clone(), notes);
+            let tell = with_app(|app| {
                 app.doc.mark_saved();
                 app.path = Some(path);
                 app.foreign = false;
                 app.refresh_ui();
+                let tell = !told.1.is_empty() && app.told.as_ref() != Some(&told);
+                app.told = Some(told.clone());
+                tell.then_some((app.font, app.scale))
             });
+            if let Some(Some((font, scale))) = tell {
+                dialogs::notes(hwnd, font, scale, true, &told.1);
+            }
             true
         }
         Some(Err(e)) => {
@@ -2721,6 +2733,7 @@ fn replace_document(doc: Document, path: Option<PathBuf>, foreign: bool, transpa
         app.path = path;
         app.foreign = foreign;
         app.transparent_source = transparent_source;
+        app.told = None;
         app.stroke = None;
         app.xform = None;
         app.liquify = None;
@@ -2777,13 +2790,20 @@ fn run_later(hwnd: HWND, later: Later) {
             if let Some((path, kind)) = dialogs::pick_file(hwnd, true, export_filter(), "png", &name.to_string_lossy(), kind) {
                 // 导出成哪种格式看文件名的扩展名；同是 PNG，垫不垫背景色看选的类型。
                 let result = with_app(|app| match extension(&path).as_str() {
-                    "psd" => psd::save(&app.doc, &path),
-                    "ora" => ora::save(&app.doc, &path),
-                    "jpg" | "jpeg" => image::export_jpeg(&app.doc, &path),
-                    _ => image::export_png(&app.doc, &path, kind == EXPORT_TRANSPARENT_PNG),
+                    "psd" => psd::save(&app.doc, &path).map(|()| Vec::new()),
+                    "sai2" => sai2::save(&app.doc, &path),
+                    "ora" => ora::save(&app.doc, &path).map(|()| Vec::new()),
+                    "jpg" | "jpeg" => image::export_jpeg(&app.doc, &path).map(|()| Vec::new()),
+                    _ => image::export_png(&app.doc, &path, kind == EXPORT_TRANSPARENT_PNG).map(|()| Vec::new()),
                 });
-                if let Some(Err(e)) = result {
-                    dialogs::message(hwnd, &trf!("导出失败：{e}", "Export failed: {e}"));
+                match result {
+                    Some(Err(e)) => dialogs::message(hwnd, &trf!("导出失败：{e}", "Export failed: {e}")),
+                    Some(Ok(notes)) if !notes.is_empty() => {
+                        if let Some((font, scale)) = with_app(|app| (app.font, app.scale)) {
+                            dialogs::notes(hwnd, font, scale, true, &notes);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

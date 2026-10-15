@@ -476,9 +476,9 @@ pub fn shortcuts(owner: HWND, font: HFONT, scale: f32, current: &Keymap) -> Opti
 
 // ---- 打开文件后的说明 ----
 
-/// 打开别的格式的文件之后，把没能照原样读进来的内容列给用户看。
-/// 条目可能很多、很长，所以放在一个能滚动、能复制的文本框里，而不是系统的消息框。
-pub fn notes(owner: HWND, font: HFONT, scale: f32, notes: &[String]) {
+/// 打开别的格式的文件之后，把没能照原样读进来的内容列给用户看；`saved` 为真时是存成存不下全部内容的格式之后，
+/// 列的是怎么处理的。条目可能很多、很长，所以放在一个能滚动、能复制的文本框里，而不是系统的消息框。
+pub fn notes(owner: HWND, font: HFONT, scale: f32, saved: bool, notes: &[String]) {
     unsafe {
         let Ok(hinst) = GetModuleHandleW(None) else { return };
         let class = w!("zhibi_dialog");
@@ -504,7 +504,7 @@ pub fn notes(owner: HWND, font: HFONT, scale: f32, notes: &[String]) {
         let Ok(dlg) = CreateWindowExW(
             WS_EX_DLGMODALFRAME,
             class,
-            PCWSTR(wide(tr("文件已经打开", "File Opened")).as_ptr()),
+            PCWSTR(wide(if saved { tr("文件已经保存", "File Saved") } else { tr("文件已经打开", "File Opened") }).as_ptr()),
             style,
             (or.left + or.right - ww) / 2,
             (or.top + or.bottom - wh) / 2,
@@ -518,7 +518,12 @@ pub fn notes(owner: HWND, font: HFONT, scale: f32, notes: &[String]) {
             return;
         };
         let head = RECT { left: px(16), top: px(14), right: cw - px(16), bottom: px(38) };
-        child(dlg, w!("STATIC"), tr("有些内容没能照原样读进来：", "Some content could not be read as it was:"), WINDOW_STYLE(0), head, -1, font);
+        let heading = if saved {
+            tr("这种格式存不下全部内容，下面这些是这样处理的：", "This format cannot hold everything; here is what was done:")
+        } else {
+            tr("有些内容没能照原样读进来：", "Some content could not be read as it was:")
+        };
+        child(dlg, w!("STATIC"), heading, WINDOW_STYLE(0), head, -1, font);
         // 文本框里换行要用回车加换行；条目之间空一行。
         let text = notes.join("\r\n\r\n");
         let body = RECT { left: px(16), top: px(44), right: cw - px(16), bottom: ch - px(58) };

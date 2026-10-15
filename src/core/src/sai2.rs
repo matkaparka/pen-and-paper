@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! 参照软件第 2 版的文件（`.sai2`）的读取（规格 F-146，实现方案 §3.21）。只读不写。
+//! 参照软件第 2 版的文件（`.sai2`）的读写（规格 F-146，实现方案 §3.21、§3.23）。
 //!
 //! 文件是一张块表加上一串块。图层记录（`layr`）从上往下排，每层的像素在编号相同的 `lpix` 块里，
 //! 蒙版在 `mpix` 块里。像素按 32 行高的横条存，一条里是一串 32×32 的块：全透明的一段、一种颜色的一块、
@@ -7,15 +7,18 @@
 //!（每个字节从最低位读起）。值是 16 位、预乘透明度，1.0 是 0x4000。
 //!
 //! 合并图像（`intg`）也读得出来（`merged`），只拿来核对我们合成的结果。
+//!
+//! 写（`save`）是读的反过来。文件头和 `hist` 里看不出意思的几个数照参照软件自己存的样本填；
+//! 这种格式存不下的（填充图层、图层样式等）画进像素或者丢掉，返回给用户的说明里交代。
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::document::{BlendMode, Document, Kind, Layer, LayerProps, Mask, MAX_SIDE};
+use crate::document::{BlendMode, Document, Kind, Layer, LayerProps, Mask, Paint, MAX_SIDE};
 use crate::lang::tr;
-use crate::ora::shared::{self, invalid, Notes};
+use crate::ora::shared::{self, background_name, invalid, save_atomically, store_row, Notes};
 use crate::tile::{GrayMap, TileMap, TILE};
 use crate::trf;
 use crate::{Rect, ONE};
@@ -37,6 +40,15 @@ const SAMPLES: usize = BLOCK * BLOCK;
 const FULL: i32 = 0x4000;
 /// 文件里没有分辨率，按这个算。
 const DEFAULT_DPI: u32 = 72;
+/// 写的时候块标记的第一个字节（新文件里都是它）。
+const MARK: u8 = 0xFF;
+/// 文件头里 0x10 处的标志和 0x1C 处的数：意思不知道，照参照软件 2026 版自己存的样本填（实现方案 §3.23）。
+const HEAD_FLAGS: u32 = 0x0100_0000;
+const HEAD_1C: u32 = 0x001C_599A;
+/// 一串 0 最多写多少个（码里能写到 135，参照软件存的文件里见到的最多是 134）。
+const MAX_ZERO_RUN: usize = 134;
+/// 图层名最多写多少个 UTF-16 单元。
+const MAX_NAME: usize = 255;
 
 struct Chunk {
     tag: [u8; 4],
@@ -81,7 +93,7 @@ struct Record {
 pub fn load(path: &Path) -> io::Result<(Document, Vec<String>)> {
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
-    let (w, h, chunks) = read_table(&mut file, size)?;
+    let (w, h, active, chunks) = read_table(&mut file, size)?;
     let mut notes = Notes::default();
     let keep = Document::keep_area(w, h);
     let pixels: HashMap<u32, &Chunk> = chunks.iter().filter(|c| &c.tag == b"lpix").map(|c| (c.id, c)).collect();
@@ -97,6 +109,7 @@ pub fn load(path: &Path) -> io::Result<(Document, Vec<String>)> {
     }
     // 本程序的图层列表自下而上，组排在它里面的东西后面：倒过来正好。
     let mut layers = Vec::new();
+    let mut ids = Vec::new();
     for r in records.into_iter().rev() {
         let props = LayerProps {
             name: r.name.clone(),
@@ -154,14 +167,19 @@ pub fn load(path: &Path) -> io::Result<(Document, Vec<String>)> {
         }
         layer.depth = r.depth;
         layers.push(layer);
+        ids.push(r.id);
     }
     let mut doc = Document::from_layers(w, h, [255; 3], layers);
     doc.dpi = DEFAULT_DPI;
+    // 文件头里记着参照软件的当前图层（实现方案 §3.21）。
+    if let Some(i) = ids.iter().position(|&id| id == active) {
+        doc.set_active(i);
+    }
     Ok((doc, notes.into_vec()))
 }
 
-/// 文件头和块表。返回画布的宽、高和各块（按在文件里的位置排好，各自知道到哪里结束）。
-fn read_table(file: &mut File, size: u64) -> io::Result<(i32, i32, Vec<Chunk>)> {
+/// 文件头和块表。返回画布的宽、高、当前图层的编号和各块（各自知道到哪里结束）。
+fn read_table(file: &mut File, size: u64) -> io::Result<(i32, i32, u32, Vec<Chunk>)> {
     let mut head = [0u8; 64];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut head).map_err(|_| invalid(tr("文件头不完整", "incomplete header")))?;
@@ -200,7 +218,7 @@ fn read_table(file: &mut File, size: u64) -> io::Result<(i32, i32, Vec<Chunk>)> 
         let k = starts.partition_point(|&s| s <= c.start);
         c.end = starts.get(k).copied().unwrap_or(size);
     }
-    Ok((w as i32, h as i32, chunks))
+    Ok((w as i32, h as i32, u32_at(36), chunks))
 }
 
 fn read_chunk(file: &mut File, c: &Chunk) -> io::Result<Vec<u8>> {
@@ -271,44 +289,51 @@ fn parse_record(rec: &[u8]) -> io::Result<Record> {
     Ok(r)
 }
 
-/// 混合模式的编号。参照软件自己特有的五种（`add `、`sub `、`sbad`、`ddge`、`burn`）是本程序的
-/// 提亮、压暗、提亮/压暗、柔和减淡、柔和加深（公式是拿用户文件里的合并图像拟合出来的，见实现方案 §3.21）。
-fn blend_mode(code: &[u8; 4]) -> Option<BlendMode> {
+/// 混合模式的编号（实现方案 §3.21），读写共用。参照软件自己特有的五种（`add `、`sub `、`sbad`、`ddge`、`burn`）是本程序的
+/// 提亮、压暗、提亮/压暗、柔和减淡、柔和加深（公式是拿用户文件里的合并图像拟合出来的）。组的穿透另写成 `pass`。
+const MODES: [(&[u8; 4], BlendMode); 31] = {
     use BlendMode::*;
-    Some(match code {
-        b"norm" => Normal,
-        b"dark" => Darken,
-        b"mult" => Multiply,
-        b"cbrn" => ColorBurn,
-        b"burn" => SoftBurn,
-        b"lbrn" => LinearBurn,
-        b"drkc" => DarkerColor,
-        b"litn" => Lighten,
-        b"scrn" => Screen,
-        b"cddg" => ColorDodge,
-        b"ddge" => SoftDodge,
-        b"lddg" => Add,
-        b"add " => Brighten,
-        b"litc" => LighterColor,
-        b"over" => Overlay,
-        b"slit" => SoftLight,
-        b"hlit" => HardLight,
-        b"vlit" => VividLight,
-        b"llit" => LinearLight,
-        b"sbad" => BrightenDim,
-        b"plit" => PinLight,
-        b"hmix" => HardMix,
-        b"diff" => Difference,
-        b"excl" => Exclusion,
-        b"fsub" => Subtract,
-        b"sub " => Dim,
-        b"fdiv" => Divide,
-        b"hue " => Hue,
-        b"sat " => Saturation,
-        b"col " => Color,
-        b"lum " => Luminosity,
-        _ => return None,
-    })
+    [
+        (b"norm", Normal),
+        (b"dark", Darken),
+        (b"mult", Multiply),
+        (b"cbrn", ColorBurn),
+        (b"burn", SoftBurn),
+        (b"lbrn", LinearBurn),
+        (b"drkc", DarkerColor),
+        (b"litn", Lighten),
+        (b"scrn", Screen),
+        (b"cddg", ColorDodge),
+        (b"ddge", SoftDodge),
+        (b"lddg", Add),
+        (b"add ", Brighten),
+        (b"litc", LighterColor),
+        (b"over", Overlay),
+        (b"slit", SoftLight),
+        (b"hlit", HardLight),
+        (b"vlit", VividLight),
+        (b"llit", LinearLight),
+        (b"sbad", BrightenDim),
+        (b"plit", PinLight),
+        (b"hmix", HardMix),
+        (b"diff", Difference),
+        (b"excl", Exclusion),
+        (b"fsub", Subtract),
+        (b"sub ", Dim),
+        (b"fdiv", Divide),
+        (b"hue ", Hue),
+        (b"sat ", Saturation),
+        (b"col ", Color),
+        (b"lum ", Luminosity),
+    ]
+};
+
+fn blend_mode(code: &[u8; 4]) -> Option<BlendMode> {
+    MODES.iter().find(|(c, _)| *c == code).map(|&(_, m)| m)
+}
+
+fn blend_code(mode: BlendMode) -> &'static [u8; 4] {
+    MODES.iter().find(|&&(_, m)| m == mode).map_or(b"norm", |&(c, _)| c)
 }
 
 /// 一条一条地走像素数据：`dpcm`，每条的长度，各条的数据。对每一个有内容的块调用 `put(列, 行, 块)`，
@@ -536,7 +561,7 @@ fn decode_mask(data: &[u8], m: &MaskRef, keep: Rect) -> io::Result<Mask> {
 pub fn merged(path: &Path) -> io::Result<(i32, i32, Vec<u8>, bool)> {
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
-    let (w, h, chunks) = read_table(&mut file, size)?;
+    let (w, h, _, chunks) = read_table(&mut file, size)?;
     let chunk = chunks.iter().find(|c| &c.tag == b"intg").ok_or_else(|| invalid(tr("没有合并图像", "no merged image")))?;
     let data = read_chunk(&mut file, chunk)?;
     let bad = || invalid(tr("合并图像的数据不对", "bad merged image data"));
@@ -595,90 +620,544 @@ pub fn merged(path: &Path) -> io::Result<(i32, i32, Vec<u8>, bool)> {
     Ok((w as i32, h as i32, rgba, channels == 4))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
+// ---- 写（实现方案 §3.23） ----
 
-    /// 测试用的写法，和读的代码反过来：位流从每个字节的最低位写起。
-    #[derive(Default)]
-    struct BitWriter {
-        bytes: Vec<u8>,
-        n: usize,
+/// 存成 `.sai2`。返回要告诉用户的话：这种格式存不下、画进了像素或者丢掉了的东西（实现方案 §3.23 的表）。
+///
+/// 和 `format::save` 一样，先写进同一目录下的临时文件，完整落盘之后再改名顶替 `path`。
+/// 不会把文档标成"已保存"，那是调用方的事。
+pub fn save(doc: &Document, path: &Path) -> io::Result<Vec<String>> {
+    shared::check_document(doc)?;
+    let (layers, active, notes) = prepare(doc);
+    save_atomically(path, |file| write_file(doc, &layers, active, file))?;
+    Ok(notes)
+}
+
+/// 要写进去的图层（自下而上）、当前图层是其中第几个，以及说明。填充图层画成像素，样式、画板这些去掉；
+/// 背景色不是白的时最底下加一层"背景"（参照软件没有背景色，图层底下是白纸）。
+fn prepare(doc: &Document) -> (Vec<Layer>, usize, Vec<String>) {
+    let mut notes = Notes::default();
+    let mut out = Vec::with_capacity(doc.layers().len() + 1);
+    if doc.background != [255; 3] {
+        let [r, g, b] = doc.background.map(|c| c as u16 * 257);
+        let row = vec![[r, g, b, u16::MAX]; doc.width as usize];
+        let mut tiles = TileMap::default();
+        for y in 0..doc.height {
+            store_row(&mut tiles, doc.bounds(), 0, y, &row);
+        }
+        out.push(Layer::pixels(LayerProps { name: background_name().into(), ..Default::default() }, tiles));
+    }
+    let below = out.len();
+    for (i, src) in doc.layers().iter().enumerate() {
+        let name = src.props.name.as_str();
+        let mut layer = Layer { style: None, artboard: None, fx: Default::default(), ..src.clone() };
+        if let Kind::Fill(fill) = &src.kind {
+            notes.layer(
+                if fill.paint == Paint::Other {
+                    tr("下列填充图层（渐变、图案）本程序画不出来，存成了空图层", "These fill layers (gradients, patterns) cannot be drawn here and were saved empty")
+                } else {
+                    tr("下列填充图层存成了普通图层（这种格式没有填充图层）", "These fill layers were saved as pixel layers (the format has no fill layers)")
+                },
+                name,
+            );
+            layer.kind = Kind::Pixels;
+            layer.tiles = doc.drawn_pixels(i);
+        }
+        if src.style.is_some() {
+            notes.layer(tr("下列图层的图层样式（投影、发光等）没有存进去", "Layer styles (shadows, glows…) of these layers were not saved"), name);
+        }
+        if src.artboard.is_some() {
+            notes.layer(tr("下列画板存成了普通的组", "These artboards were saved as plain groups"), name);
+        }
+        if src.props.fill != 1.0 {
+            notes.layer(tr("下列图层的填充不透明度并进了不透明度", "The Fill opacity of these layers was merged into their opacity"), name);
+            layer.props.opacity *= src.props.fill.clamp(0.0, 1.0);
+            layer.props.fill = 1.0;
+        }
+        if !src.props.shapes {
+            notes.layer(tr("下列图层的“透明形状图层”设置没有存进去", "The Transparency Shapes setting of these layers was not saved"), name);
+            layer.props.shapes = true;
+        }
+        out.push(layer);
+    }
+    (out, doc.active() + below, notes.into_vec())
+}
+
+/// 像素或蒙版的范围，以 32 像素为单位。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Area {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+impl Area {
+    /// 盖住 `r` 的那些块；`r` 是空的就是空的范围。
+    fn covering(r: Rect) -> Area {
+        if r.is_empty() {
+            return Area::default();
+        }
+        let b = BLOCK as i32;
+        let (x0, y0, x1, y1) = (r.x0.div_euclid(b), r.y0.div_euclid(b), (r.x1 + b - 1).div_euclid(b), (r.y1 + b - 1).div_euclid(b));
+        Area { x: x0, y: y0, w: (x1 - x0) as u32, h: (y1 - y0) as u32 }
     }
 
-    impl BitWriter {
-        fn bit(&mut self, b: u32) {
-            if self.n.is_multiple_of(8) {
-                self.bytes.push(0);
-            }
-            if b != 0 {
-                *self.bytes.last_mut().unwrap() |= 1 << (self.n % 8);
-            }
-            self.n += 1;
-        }
+    fn bytes(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&self.x.to_le_bytes());
+        out[4..8].copy_from_slice(&self.y.to_le_bytes());
+        out[8..12].copy_from_slice(&self.w.to_le_bytes());
+        out[12..16].copy_from_slice(&self.h.to_le_bytes());
+        out
+    }
+}
 
-        fn bits(&mut self, v: u32, n: u32) {
-            for i in 0..n {
-                self.bit((v >> i) & 1);
-            }
+/// 一个图层要写的东西：编号、像素的范围、蒙版（编号、范围）。
+struct Plan {
+    id: u32,
+    area: Area,
+    mask: Option<(u32, Area)>,
+}
+
+fn write_file(doc: &Document, layers: &[Layer], active: usize, file: File) -> io::Result<()> {
+    let keep = doc.keep_bounds();
+    // 编号：图层自下而上从 2 起，蒙版接在后面，也是自下而上（参照软件存的样本是这样）。
+    let mut next_mask = 2 + layers.len() as u32;
+    let plans: Vec<Plan> = layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| Plan {
+            id: 2 + i as u32,
+            area: if l.is_folder() { Area::default() } else { layer_area(&l.tiles, keep) },
+            mask: l.mask.as_ref().map(|m| {
+                next_mask += 1;
+                // 整个蒙版都和范围外一样时写一块空的。
+                (next_mask - 1, mask_area(m, keep).unwrap_or(Area { x: 0, y: 0, w: 1, h: 1 }))
+            }),
+        })
+        .collect();
+
+    // 块表：hist、intg、图层记录（从上往下）、各层的像素（从上往下，每层先 lpix 后 mpix）。
+    let mut table: Vec<([u8; 4], u32)> = vec![(*b"hist", 0), (*b"intg", 0)];
+    table.extend(plans.iter().rev().map(|p| (*b"layr", p.id)));
+    for (l, p) in layers.iter().zip(&plans).rev() {
+        if !l.is_folder() {
+            table.push((*b"lpix", p.id));
+        }
+        if let Some((id, _)) = p.mask {
+            table.push((*b"mpix", id));
         }
     }
 
-    /// 一个通道（`width` 宽）的值写成差的位流（实现方案 §3.21）。
-    fn encode_channel(w: &mut BitWriter, values: &[i32], width: usize, max: i32) {
-        let mut res = vec![0; values.len()];
-        for k in 0..values.len() {
+    let mut out = BufWriter::new(file);
+    let mut head = Vec::with_capacity(64);
+    head.extend(SIGNATURE);
+    for v in [HEAD_FLAGS, doc.width as u32, doc.height as u32, HEAD_1C, table.len() as u32, plans[active].id] {
+        head.extend(v.to_le_bytes());
+    }
+    head.extend([0u8; 16]);
+    head.extend([0x80, 0x80, 0x80, 0xFF]);
+    head.extend(b"norm");
+    out.write_all(&head)?;
+    out.write_all(&vec![0u8; 16 * table.len()])?;
+
+    let mut at = (head.len() + 16 * table.len()) as u64;
+    let mut starts = Vec::with_capacity(table.len());
+    let mut put = |out: &mut BufWriter<File>, data: &[u8]| -> io::Result<()> {
+        starts.push(at);
+        at += data.len() as u64;
+        out.write_all(data)
+    };
+    put(&mut out, &hist())?;
+    // 合并图像拿要写进去的图层合成，底下不垫背景色（参照软件的合并图像有透明度）。
+    let merged = Document::from_layers(doc.width, doc.height, doc.background, layers.to_vec()).flatten_rgba();
+    put(&mut out, &encode_merged(doc.width as usize, doc.height as usize, &merged))?;
+    drop(merged);
+    for (l, p) in layers.iter().zip(&plans).rev() {
+        put(&mut out, &record(l, p))?;
+    }
+    for (l, p) in layers.iter().zip(&plans).rev() {
+        if !l.is_folder() {
+            put(&mut out, &encode_layer(&l.tiles, keep, p.area))?;
+        }
+        if let (Some(m), Some((_, area))) = (&l.mask, p.mask) {
+            put(&mut out, &encode_mask(m, keep, area))?;
+        }
+    }
+
+    out.seek(SeekFrom::Start(head.len() as u64))?;
+    for ((tag, id), start) in table.iter().zip(&starts) {
+        out.write_all(tag)?;
+        out.write_all(&id.to_le_bytes())?;
+        out.write_all(&start.to_le_bytes())?;
+    }
+    let file = out.into_inner().map_err(io::IntoInnerError::into_error)?;
+    file.sync_all()
+}
+
+/// `hist`：保存时间（协调世界时）"年月日.时分秒.2"补 0 到 64 字节，16 个随机字节，u64 的 1（实现方案 §3.23）。
+fn hist() -> Vec<u8> {
+    use std::hash::BuildHasher;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs();
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let t = secs % 86_400;
+    let text = format!("{year:04}{month:02}{day:02}.{:02}{:02}{:02}.2", t / 3600, t / 60 % 60, t % 60);
+    let mut out: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    out.resize(64, 0);
+    // 标准库的散列函数每次用随机的键，拿它当随机数就够了。
+    let random = std::collections::hash_map::RandomState::new();
+    for k in 0..2u8 {
+        out.extend(random.hash_one((now.as_nanos(), k)).to_le_bytes());
+    }
+    out.extend(1u64.to_le_bytes());
+    out
+}
+
+/// 从 1970-01-01 起的第几天换成公历的年、月、日。
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + (month <= 2) as i64, month, day)
+}
+
+/// 一条图层记录（实现方案 §3.21 的表）。8、12、20、24 写 0。
+fn record(layer: &Layer, plan: &Plan) -> Vec<u8> {
+    let p = &layer.props;
+    let folder = layer.is_folder();
+    let mut r = Vec::with_capacity(128);
+    r.extend(b"layr");
+    r.extend(plan.id.to_le_bytes());
+    r.extend([0u8; 8]);
+    r.extend(if folder { b"fold" } else { b"norm" });
+    r.extend([0u8; 8]);
+    r.extend(plan.area.bytes());
+    r.extend(if folder && p.pass_through { b"pass" } else { blend_code(p.blend) });
+    let opacity = if p.opacity.is_nan() { 0 } else { (p.opacity.clamp(0.0, 1.0) * 100.0).round() as u32 };
+    r.extend(opacity.to_le_bytes());
+    let open = matches!(layer.kind, Kind::Folder { open: true });
+    r.extend([layer.depth.min(255) as u8, p.lock_alpha as u8, p.visible as u8, p.clip as u8 | if open { 0x40 } else { 0 }]);
+    // 名字：u16 字数加 UTF-16，补 0 到 4 字节的倍数。截断时不把一对代理拆开。
+    let mut units: Vec<u16> = p.name.encode_utf16().collect();
+    if units.len() > MAX_NAME {
+        let cut = if (0xD800..0xDC00).contains(&units[MAX_NAME - 1]) { MAX_NAME - 1 } else { MAX_NAME };
+        units.truncate(cut);
+    }
+    let mut name = (units.len() as u16).to_le_bytes().to_vec();
+    name.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+    pad4(&mut name);
+    param(&mut r, b"name", &name);
+    if let (Some(m), Some((id, area))) = (&layer.mask, plan.mask) {
+        // 默认白的写成"挡住多少"（标志 1），默认黑的写成"显示多少"（标志 0）；第二个字节是启用。
+        let mut v = id.to_le_bytes().to_vec();
+        v.extend(area.bytes());
+        v.extend([hides(m) as u8, !m.disabled as u8, 1, 0]);
+        param(&mut r, b"lmsk", &v);
+    }
+    r.extend([0u8; 4]);
+    r
+}
+
+fn param(r: &mut Vec<u8>, name: &[u8; 4], value: &[u8]) {
+    r.extend(name);
+    r.extend((value.len() as u32).to_le_bytes());
+    r.extend(value);
+}
+
+fn pad4(v: &mut Vec<u8>) {
+    v.resize(v.len().next_multiple_of(4), 0);
+}
+
+/// 蒙版是不是写成"挡住多少"的那种（默认白的）。
+fn hides(m: &Mask) -> bool {
+    m.default != 0
+}
+
+/// 本程序的 15 位换成文件的 16 位（1.0 = 0x4000），四舍五入。
+#[inline]
+fn to16(v: u16) -> i32 {
+    ((v as i32).min(ONE as i32) + 1) >> 1
+}
+
+/// 图层的一块 32×32 换成文件里的 B、G、R、A。`keep` 以外的像素当透明。返回这块是不是全透明。
+fn layer_block(tiles: &TileMap, keep: Rect, col: i32, row: i32, out: &mut [[i32; SAMPLES]]) -> bool {
+    let (x0, y0) = (col * BLOCK as i32, row * BLOCK as i32);
+    let Some(tile) = tiles.get((x0.div_euclid(TILE), y0.div_euclid(TILE))) else { return true };
+    let (ox, oy) = (x0.rem_euclid(TILE) as usize, y0.rem_euclid(TILE) as usize);
+    let mut empty = true;
+    for y in 0..BLOCK {
+        for x in 0..BLOCK {
+            let k = y * BLOCK + x;
+            let (px, py) = (x0 + x as i32, y0 + y as i32);
+            let i = ((oy + y) * TILE as usize + ox + x) * 4;
+            let a = if px < keep.x0 || px >= keep.x1 || py < keep.y0 || py >= keep.y1 { 0 } else { to16(tile.0[i + 3]) };
+            // 分块里是 R、G、B、A，文件里是 B、G、R、A；颜色不超过透明度。
+            for (c, ch) in [2, 1, 0].into_iter().enumerate() {
+                out[c][k] = to16(tile.0[i + ch]).min(a);
+            }
+            out[3][k] = a;
+            empty &= a == 0;
+        }
+    }
+    empty
+}
+
+/// 蒙版的一块换成文件里的值（默认白的是"挡住多少"）。`keep` 以外当范围外。返回这块是不是全是 0（和范围外一样）。
+fn mask_block(mask: &Mask, keep: Rect, col: i32, row: i32, out: &mut [[i32; SAMPLES]]) -> bool {
+    let (x0, y0) = (col * BLOCK as i32, row * BLOCK as i32);
+    let tile = mask.tile((x0.div_euclid(TILE), y0.div_euclid(TILE)));
+    let (ox, oy) = (x0.rem_euclid(TILE) as usize, y0.rem_euclid(TILE) as usize);
+    let hides = hides(mask);
+    let mut empty = true;
+    for y in 0..BLOCK {
+        for x in 0..BLOCK {
+            let (px, py) = (x0 + x as i32, y0 + y as i32);
+            let inside = px >= keep.x0 && px < keep.x1 && py >= keep.y0 && py < keep.y1;
+            let v = match tile {
+                Some(t) if inside => t[(oy + y) * TILE as usize + ox + x],
+                _ => mask.default,
+            };
+            let f = to16(if hides { ONE as u16 - v.min(ONE as u16) } else { v });
+            out[0][y * BLOCK + x] = f;
+            empty &= f == 0;
+        }
+    }
+    empty
+}
+
+/// 有内容的块的范围。`coords` 是有分块的地方，`empty(列, 行, 草稿)` 说一块是不是空的。按文件里的精度看，
+/// 透明度低到 8 位下看不见的像素也算内容（所以不用 `content_bounds`）。
+fn area_of(coords: impl Iterator<Item = (i32, i32)>, keep: Rect, channels: usize, mut empty: impl FnMut(i32, i32, &mut [[i32; SAMPLES]]) -> bool) -> Option<Area> {
+    let mut scratch = vec![[0i32; SAMPLES]; channels];
+    let mut r = Rect::EMPTY;
+    let per_tile = TILE / BLOCK as i32;
+    for (tx, ty) in coords {
+        for sub in 0..per_tile * per_tile {
+            let (col, row) = (tx * per_tile + sub % per_tile, ty * per_tile + sub / per_tile);
+            let b = Rect { x0: col * BLOCK as i32, y0: row * BLOCK as i32, x1: (col + 1) * BLOCK as i32, y1: (row + 1) * BLOCK as i32 };
+            if !b.intersect(keep).is_empty() && r.union(b) != r && !empty(col, row, &mut scratch) {
+                r = r.union(b);
+            }
+        }
+    }
+    (!r.is_empty()).then(|| Area::covering(r))
+}
+
+/// 图层像素的范围；完全空的图层范围是 0。
+fn layer_area(tiles: &TileMap, keep: Rect) -> Area {
+    area_of(tiles.coords(), keep, 4, |col, row, out| layer_block(tiles, keep, col, row, out)).unwrap_or_default()
+}
+
+/// 蒙版里和范围外不一样的那些块的范围；整个都一样时是 None。
+fn mask_area(mask: &Mask, keep: Rect) -> Option<Area> {
+    area_of(mask.tiles.coords(), keep, 1, |col, row, out| mask_block(mask, keep, col, row, out))
+}
+
+/// 图层的像素块（`lpix`）。范围是空的就是 4 个字节的 0。
+fn encode_layer(tiles: &TileMap, keep: Rect, area: Area) -> Vec<u8> {
+    if area.w == 0 || area.h == 0 {
+        return vec![0; 4];
+    }
+    encode_strips(area, 4, |col, row, out| layer_block(tiles, keep, col, row, out))
+}
+
+fn encode_mask(mask: &Mask, keep: Rect, area: Area) -> Vec<u8> {
+    encode_strips(area, 1, |col, row, out| mask_block(mask, keep, col, row, out))
+}
+
+/// `dpcm`、每条的长度、各条（实现方案 §3.23）。`block(列, 行, 值)` 填好一块的值，返回这块是不是全是 0。
+/// 每条从范围左边写到右边：全是 0 的连成一段写类型 0，一种颜色的写类型 5，其余写类型 A，最后类型 F。
+fn encode_strips(area: Area, channels: usize, mut block: impl FnMut(i32, i32, &mut [[i32; SAMPLES]]) -> bool) -> Vec<u8> {
+    let mut values = vec![[0i32; SAMPLES]; channels];
+    let end = area.x + area.w as i32;
+    let mut strips = Vec::with_capacity(area.h as usize);
+    for row in area.y..area.y + area.h as i32 {
+        let mut s = Vec::new();
+        let mut run = 0i32;
+        let flush = |s: &mut Vec<u8>, run: &mut i32, col: i32| {
+            if *run > 0 {
+                s.extend([MARK, (col - *run).rem_euclid(16) as u8]);
+                s.extend((*run as u16 - 1).to_le_bytes());
+                *run = 0;
+            }
+        };
+        for col in area.x..end {
+            if block(col, row, &mut values) {
+                run += 1;
+                continue;
+            }
+            flush(&mut s, &mut run, col);
+            let low = col.rem_euclid(16) as u8;
+            if values.iter().all(|v| v.iter().all(|&x| x == v[0])) {
+                s.extend([MARK, 0x50 | low]);
+                s.extend(values.iter().flat_map(|v| (v[0] as u16).to_le_bytes()));
+            } else {
+                let mut bits = BitWriter::default();
+                for v in &values {
+                    put_residuals(&mut bits, &residuals_of(v, BLOCK, FULL));
+                }
+                let body = bits.finish();
+                s.extend([MARK, 0xA0 | low]);
+                s.extend((body.len() as u16).to_le_bytes());
+                s.extend(body);
+            }
+        }
+        flush(&mut s, &mut run, end);
+        s.extend([MARK, 0xF0 | end.rem_euclid(16) as u8]);
+        strips.push(s);
+    }
+    dpcm(&strips)
+}
+
+fn dpcm(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"dpcm".to_vec();
+    parts.iter().for_each(|p| out.extend((p.len() as u32).to_le_bytes()));
+    parts.iter().for_each(|p| out.extend(p));
+    pad4(&mut out);
+    out
+}
+
+/// 合并图像（`intg`）：`rgba` 是整张画布 8 位、不预乘的 RGBA。256×256 一格，格子里逐行 B、G、R、A 各一串，
+/// 每行补齐到字节；每一行格子后面是 `FF` 加格子的列数。
+fn encode_merged(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
+    let (tx, ty) = (w.div_ceil(256), h.div_ceil(256));
+    let mut cells = Vec::with_capacity(tx * ty);
+    for gy in 0..ty {
+        for gx in 0..tx {
+            let (tw, th) = ((w - gx * 256).min(256), (h - gy * 256).min(256));
+            let mut planes = vec![vec![0i32; tw * th]; 4];
+            for y in 0..th {
+                for x in 0..tw {
+                    let o = ((gy * 256 + y) * w + gx * 256 + x) * 4;
+                    for (c, ch) in [2, 1, 0, 3].into_iter().enumerate() {
+                        planes[c][y * tw + x] = rgba[o + ch] as i32;
+                    }
+                }
+            }
+            let res: Vec<Vec<i32>> = planes.iter().map(|p| residuals_of(p, tw, 255)).collect();
+            let mut bits = BitWriter::default();
+            for y in 0..th {
+                for r in &res {
+                    put_residuals(&mut bits, &r[y * tw..(y + 1) * tw]);
+                }
+                bits.align();
+            }
+            let mut cell = vec![MARK, gx as u8];
+            cell.extend(bits.finish());
+            cells.push(cell);
+        }
+    }
+    let mut out = b"dpcm".to_vec();
+    cells.iter().for_each(|c| out.extend((c.len() as u32).to_le_bytes()));
+    for row in cells.chunks(tx) {
+        row.iter().for_each(|c| out.extend(c));
+        out.extend([MARK, tx as u8]);
+    }
+    pad4(&mut out);
+    out
+}
+
+/// 每个字节从最低位写起的位流（`Bits` 反过来）。
+#[derive(Default)]
+struct BitWriter {
+    bytes: Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl BitWriter {
+    /// 写 `v` 的低 `n` 位（n ≤ 32），从最低位起。
+    fn put(&mut self, v: u32, n: u32) {
+        self.acc |= (v as u64 & ((1u64 << n) - 1)) << self.n;
+        self.n += n;
+        while self.n >= 8 {
+            self.bytes.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+
+    /// 补齐到字节。
+    fn align(&mut self) {
+        if self.n > 0 {
+            self.bytes.push(self.acc as u8);
+            self.acc = 0;
+            self.n = 0;
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.align();
+        self.bytes
+    }
+}
+
+/// 值换成差（预测同 `unpredict`）。
+fn residuals_of(values: &[i32], width: usize, max: i32) -> Vec<i32> {
+    (0..values.len())
+        .map(|k| {
             let (x, y) = (k % width, k / width);
             let pred = if y == 0 {
-                if x == 0 {
-                    0
-                } else {
-                    values[k - 1]
-                }
+                if x == 0 { 0 } else { values[k - 1] }
             } else if x == 0 {
                 values[k - width]
             } else {
                 (values[k - 1] + values[k - width] - values[k - width - 1]).clamp(0, max)
             };
-            res[k] = values[k] - pred;
-        }
-        let mut k = 0;
-        while k < res.len() {
-            if res[k] == 0 {
-                let run = res[k..].iter().take_while(|&&r| r == 0).count();
-                if run >= 8 {
-                    let n = run.min(134);
-                    w.bits(0, 7);
-                    w.bit(1);
-                    w.bit(1);
-                    w.bits((n - 8) as u32, 7);
-                    k += n;
-                } else {
-                    w.bit(1);
-                    w.bit(0);
-                    k += 1;
-                }
-                continue;
+            values[k] - pred
+        })
+        .collect()
+}
+
+/// 差的写法（`residuals` 反过来）：0 连着 8 个以上写成一串，其余逐个写。
+fn put_residuals(bits: &mut BitWriter, res: &[i32]) {
+    let mut k = 0;
+    while k < res.len() {
+        let r = res[k];
+        if r == 0 {
+            let run = res[k..].iter().take(MAX_ZERO_RUN).take_while(|&&v| v == 0).count();
+            if run >= 8 {
+                // 7 个 0、1、1（n = 16），再 7 位：个数减 8。
+                bits.put(0b11 << 7, 9);
+                bits.put((run - 8) as u32, 7);
+                k += run;
+            } else {
+                // n = 1：1、0。
+                bits.put(0b01, 2);
+                k += 1;
             }
-            let mag = res[k].unsigned_abs() + 1;
-            let n = 32 - mag.leading_zeros();
-            w.bits(0, (n - 1) / 2);
-            w.bit(1);
-            w.bit((n - 1) % 2);
-            w.bits(mag - (1 << (n - 1)), n - 1);
-            w.bit((res[k] < 0) as u32);
-            k += 1;
+            continue;
         }
+        // |差| + 1 有 n 位：z = (n − 1) / 2 个 0、1、f = (n − 1) % 2，再 n − 1 位，最后符号。
+        let m = r.unsigned_abs() + 1;
+        let n = 32 - m.leading_zeros();
+        let z = (n - 1) / 2;
+        bits.put(1 << z | ((n - 1) % 2) << (z + 1), z + 2);
+        bits.put(m - (1 << (n - 1)), n - 1);
+        bits.put((r < 0) as u32, 1);
+        k += 1;
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
 
     /// 一块压缩块：各通道 1024 个值。
     fn coded_block(channels: &[Vec<i32>]) -> Vec<u8> {
         let mut w = BitWriter::default();
         for c in channels {
-            encode_channel(&mut w, c, BLOCK, FULL);
+            put_residuals(&mut w, &residuals_of(c, BLOCK, FULL));
         }
-        w.bytes
+        w.finish()
     }
 
     /// 一条里的一段。
@@ -717,19 +1196,9 @@ mod tests {
         out
     }
 
-    fn dpcm(strips: &[Vec<u8>]) -> Vec<u8> {
-        let mut out = b"dpcm".to_vec();
-        strips.iter().for_each(|s| out.extend((s.len() as u32).to_le_bytes()));
-        strips.iter().for_each(|s| out.extend(s));
-        while !out.len().is_multiple_of(4) {
-            out.push(0);
-        }
-        out
-    }
-
     /// 一条图层记录。`area` 是（左, 上, 宽, 高），以 32 像素为单位。
     #[allow(clippy::too_many_arguments)]
-    fn record(id: u32, kind: &[u8; 4], area: (i32, i32, u32, u32), blend: &[u8; 4], opacity: u32, flags: [u8; 4], name: &str, mask: Option<[u8; 24]>) -> Vec<u8> {
+    fn raw_record(id: u32, kind: &[u8; 4], area: (i32, i32, u32, u32), blend: &[u8; 4], opacity: u32, flags: [u8; 4], name: &str, mask: Option<[u8; 24]>) -> Vec<u8> {
         let mut r = b"layr".to_vec();
         r.extend(id.to_le_bytes());
         r.extend([0u8; 8]);
@@ -829,11 +1298,11 @@ mod tests {
             100,
             70,
             &[
-                (b"layr", 4, record(4, b"fold", (0, 0, 0, 0), b"pass", 100, [0, 0, 1, 0x40], "组", None)),
-                (b"layr", 6, record(6, b"norm", (1, 0, 1, 1), b"norm", 100, [1, 0, 1, 0], "显示", Some(lmsk(10, 1, 0)))),
-                (b"layr", 3, record(3, b"norm", (1, 0, 1, 1), b"mult", 50, [1, 0, 1, 0], "挡住", Some(lmsk(9, 1, 1)))),
-                (b"layr", 2, record(2, b"norm", (0, 0, 3, 2), b"add ", 100, [0, 1, 1, 1], "Layer", None)),
-                (b"layr", 5, record(5, b"symm", (0, 0, 0, 0), b"norm", 100, [0, 0, 1, 0], "尺子", None)),
+                (b"layr", 4, raw_record(4, b"fold", (0, 0, 0, 0), b"pass", 100, [0, 0, 1, 0x40], "组", None)),
+                (b"layr", 6, raw_record(6, b"norm", (1, 0, 1, 1), b"norm", 100, [1, 0, 1, 0], "显示", Some(lmsk(10, 1, 0)))),
+                (b"layr", 3, raw_record(3, b"norm", (1, 0, 1, 1), b"mult", 50, [1, 0, 1, 0], "挡住", Some(lmsk(9, 1, 1)))),
+                (b"layr", 2, raw_record(2, b"norm", (0, 0, 3, 2), b"add ", 100, [0, 1, 1, 1], "Layer", None)),
+                (b"layr", 5, raw_record(5, b"symm", (0, 0, 0, 0), b"norm", 100, [0, 0, 1, 0], "尺子", None)),
                 (b"lpix", 2, pixels),
                 (b"lpix", 3, white()),
                 (b"lpix", 6, white()),
@@ -873,7 +1342,7 @@ mod tests {
     fn rejects_broken_files() {
         let error = |bytes: &[u8]| load_bytes(bytes).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(error(b"not a canvas file at all, definitely not").contains("文件头"));
-        let one = |strip: Vec<u8>| file(64, 32, &[(b"layr", 2, record(2, b"norm", (0, 0, 1, 1), b"norm", 100, [0, 0, 1, 0], "x", None)), (b"lpix", 2, dpcm(&[strip]))]);
+        let one = |strip: Vec<u8>| file(64, 32, &[(b"layr", 2, raw_record(2, b"norm", (0, 0, 1, 1), b"norm", 100, [0, 0, 1, 0], "x", None)), (b"lpix", 2, dpcm(&[strip]))]);
         // 块的标记里的列号不对。
         assert!(error(&one(vec![0xff, 0x53, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xf1])).contains("块的标记"));
         // 压缩块的数据不够。
@@ -882,6 +1351,498 @@ mod tests {
         let mut big = file(64, 32, &[]);
         big[20..24].copy_from_slice(&(MAX_SIDE as u32 + 1).to_le_bytes());
         assert!(error(&big).contains("不支持"));
+    }
+
+    // ---- 写 ----
+
+    use crate::document::{Artboard, Fill};
+    use crate::ora::shared::testing::{pixel as pixel_of, set_pixel, Rng, Temp};
+
+    /// 存了再读回来。返回读回来的文档、存的时候的说明和文件的字节。
+    fn round_trip(doc: &Document) -> (Document, Vec<String>, Vec<u8>) {
+        let dir = Temp::new("sai2");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("t.sai2");
+        let notes = save(doc, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (back, read_notes) = load(&path).unwrap();
+        assert!(read_notes.is_empty(), "{read_notes:?}");
+        (back, notes, bytes)
+    }
+
+    /// 存进文件、再读回来以后该有的像素：16 位里放不下 15 位的最低位。
+    fn after(px: [u16; 4]) -> [u16; 4] {
+        let a = to16(px[3]);
+        let c = |v: u16| (to16(v).min(a) * 2) as u16;
+        [c(px[0]), c(px[1]), c(px[2]), (a * 2) as u16]
+    }
+
+    fn mask_value(m: &Mask, x: i32, y: i32) -> u16 {
+        m.tile((x.div_euclid(TILE), y.div_euclid(TILE))).map_or(m.default, |t| t[(y.rem_euclid(TILE) * TILE + x.rem_euclid(TILE)) as usize])
+    }
+
+    fn set_mask(m: &mut Mask, x: i32, y: i32, v: u16) {
+        let default = m.default;
+        m.tiles.get_mut((x.div_euclid(TILE), y.div_euclid(TILE)), default)[(y.rem_euclid(TILE) * TILE + x.rem_euclid(TILE)) as usize] = v;
+    }
+
+    /// 图层、组（穿透、隔离、套两层、展开）、蒙版（默认白、默认黑、停用、组上的）、剪贴、保护不透明度、隐藏、
+    /// 31 种混合模式、伸出画布、空图层、超长的名字都有；像素有随机的、整块一种颜色的、隔着空块的。
+    fn rich_document() -> Document {
+        let (w, h) = (200, 130);
+        let mut rng = Rng(0x5A12_0001);
+        let mut bottom = Layer::new("底 bottom");
+        for y in 0..h {
+            for x in -40..w {
+                set_pixel(&mut bottom, x, y, rng.pixel());
+            }
+        }
+        // 整块一种颜色的（对齐到 32），隔一块空的再来一块。
+        let mut solid = Layer::new("一种颜色");
+        for y in 64..96 {
+            for x in (32..64).chain(96..128) {
+                set_pixel(&mut solid, x, y, [1000, 2000, 3001, 9000]);
+            }
+        }
+        solid.props.clip = true;
+        let mut hidden = Layer::new("藏起来");
+        hidden.props.visible = false;
+        set_pixel(&mut hidden, 3, 3, [ONE as u16; 4]);
+        let mut locked = Layer::new("保护");
+        locked.props.lock_alpha = true;
+        for x in 0..w {
+            set_pixel(&mut locked, x, 100, rng.pixel());
+        }
+        let mut a = Layer::folder("组 A");
+        a.props = LayerProps { pass_through: false, blend: BlendMode::Multiply, opacity: 0.8, ..a.props };
+        a.kind = Kind::Folder { open: true };
+        let mut mask = Mask::white();
+        for y in 10..50 {
+            for x in 20..90 {
+                set_mask(&mut mask, x, y, ((x * 300 + y * 7) % (ONE as i32 + 1)) as u16);
+            }
+        }
+        a.mask = Some(mask);
+        let mut deep = Layer::new("深");
+        for y in 0..40 {
+            for x in 150..230 {
+                set_pixel(&mut deep, x, y, rng.pixel());
+            }
+        }
+        let mut inner = Layer::folder("里");
+        inner.kind = Kind::Folder { open: false };
+        let mut b = Layer::folder("组 B");
+        b.kind = Kind::Folder { open: false };
+        let mut dark = Layer::new("黑蒙版");
+        for y in 20..60 {
+            for x in 20..60 {
+                set_pixel(&mut dark, x, y, [5000, 6000, 7000, 8000]);
+            }
+        }
+        let mut black = Mask { tiles: GrayMap::default(), default: 0, disabled: true };
+        for y in 30..40 {
+            for x in 30..70 {
+                set_mask(&mut black, x, y, (x * 400) as u16);
+            }
+        }
+        dark.mask = Some(black);
+        let mut layers = vec![bottom, solid, hidden, locked, a, deep, inner, b, dark];
+        for (d, depth) in [(1, 1), (2, 1), (3, 1), (5, 2), (6, 1)] {
+            layers[d].depth = depth;
+        }
+        for (k, mode) in BlendMode::ALL.into_iter().chain(BlendMode::EXTRA).enumerate() {
+            let mut l = Layer::new(&format!("{k} {mode:?}"));
+            l.props = LayerProps { blend: mode, opacity: (k % 10) as f32 / 10.0 + 0.05, ..l.props };
+            let (x0, y0) = ((k as i32 * 13) % w, (k as i32 * 7) % h);
+            for y in y0..y0 + 9 {
+                for x in x0..x0 + 9 {
+                    set_pixel(&mut l, x, y, rng.pixel());
+                }
+            }
+            layers.push(l);
+        }
+        layers.push(Layer::new("空"));
+        let mut long = Layer::new(&"长".repeat(300));
+        set_pixel(&mut long, w - 1, h - 1, [1, 1, 1, 1]);
+        layers.push(long);
+        let mut doc = Document::from_layers(w, h, [255; 3], layers);
+        doc.set_active(5);
+        doc
+    }
+
+    #[test]
+    fn writes_what_it_reads() {
+        let doc = rich_document();
+        let (back, notes, _) = round_trip(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!((back.width, back.height, back.layers().len(), back.active()), (doc.width, doc.height, doc.layers().len(), 5));
+        let keep = doc.keep_bounds();
+        for (a, b) in doc.layers().iter().zip(back.layers()) {
+            let (p, q) = (&a.props, &b.props);
+            let name: String = p.name.chars().take(255).collect();
+            assert_eq!(q.name, name);
+            assert_eq!((a.depth, a.kind.clone(), p.visible, p.lock_alpha, p.clip), (b.depth, b.kind.clone(), q.visible, q.lock_alpha, q.clip), "{name}");
+            assert_eq!((q.opacity * 100.0).round(), (p.opacity * 100.0).round(), "{name}");
+            if a.is_folder() {
+                assert_eq!(q.pass_through, p.pass_through, "{name}");
+            }
+            if !(a.is_folder() && p.pass_through) {
+                assert_eq!(q.blend, p.blend, "{name}");
+            }
+            for y in keep.y0..keep.y1 {
+                for x in keep.x0..keep.x1 {
+                    assert_eq!(pixel_of(b, x, y), after(pixel_of(a, x, y)), "{name} ({x}, {y})");
+                }
+            }
+            assert_eq!(a.mask.is_some(), b.mask.is_some(), "{name}");
+            if let (Some(m), Some(n)) = (&a.mask, &b.mask) {
+                assert_eq!((n.default, n.disabled), (m.default, m.disabled), "{name}");
+                for y in keep.y0..keep.y1 {
+                    for x in keep.x0..keep.x1 {
+                        let v = mask_value(m, x, y);
+                        let want = if hides(m) { ONE as u16 - 2 * to16(ONE as u16 - v) as u16 } else { 2 * to16(v) as u16 };
+                        assert_eq!(mask_value(n, x, y), want, "{name} ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 读一个我们写的文件的块表：(类型, 编号, 数据)，按块表的顺序。
+    fn chunks_of(bytes: &[u8]) -> Vec<([u8; 4], u32, &[u8])> {
+        let n = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+        let entries: Vec<([u8; 4], u32, usize)> = (0..n)
+            .map(|i| {
+                let e = &bytes[64 + 16 * i..80 + 16 * i];
+                (e[0..4].try_into().unwrap(), u32::from_le_bytes(e[4..8].try_into().unwrap()), u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize)
+            })
+            .collect();
+        (0..n).map(|i| (entries[i].0, entries[i].1, &bytes[entries[i].2..entries.get(i + 1).map_or(bytes.len(), |e| e.2)])).collect()
+    }
+
+    #[test]
+    fn file_looks_like_the_reference_files() {
+        let doc = rich_document();
+        let (_, _, bytes) = round_trip(&doc);
+        let u32_at = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        assert_eq!(&bytes[..16], SIGNATURE);
+        assert_eq!((u32_at(&bytes, 16), u32_at(&bytes, 20), u32_at(&bytes, 24), u32_at(&bytes, 28)), (HEAD_FLAGS, 200, 130, HEAD_1C));
+        // 当前图层是第 5 层，编号 2 + 5。
+        assert_eq!(u32_at(&bytes, 36), 7);
+        assert_eq!(&bytes[40..64], &[[0u8; 16].as_slice(), &[0x80, 0x80, 0x80, 0xFF], b"norm"].concat()[..]);
+        let chunks = chunks_of(&bytes);
+        // 顺序：hist、intg、图层记录（从上往下）、各层的像素（从上往下，先 lpix 后 mpix）。
+        let n = doc.layers().len() as u32;
+        let order: Vec<String> = chunks.iter().map(|(t, id, _)| format!("{}{id}", String::from_utf8_lossy(t))).collect();
+        let mut want = vec!["hist0".to_string(), "intg0".into()];
+        want.extend((0..n).rev().map(|i| format!("layr{}", i + 2)));
+        // 蒙版：组 A（第 4 层）在下，编号 2 + n；黑蒙版（第 8 层）在上，编号 3 + n。
+        for i in (0..n).rev() {
+            if !doc.layers()[i as usize].is_folder() {
+                want.push(format!("lpix{}", i + 2));
+            }
+            match i {
+                4 => want.push(format!("mpix{}", n + 2)),
+                8 => want.push(format!("mpix{}", n + 3)),
+                _ => {}
+            }
+        }
+        assert_eq!(order, want);
+        // 每块数据补齐到 4 字节；hist 是 88 字节，时间后面补 0 到 64 字节，最后是 1。
+        assert!(chunks.iter().all(|(_, _, d)| d.len() % 4 == 0));
+        let hist = chunks[0].2;
+        let text = String::from_utf16(&hist[..64].as_chunks::<2>().0.iter().map(|u| u16::from_le_bytes(*u)).take_while(|&u| u != 0).collect::<Vec<_>>()).unwrap();
+        assert!(text.len() == 17 && text.ends_with(".2") && text.as_bytes()[8] == b'.', "{text}");
+        assert_eq!((hist.len(), &hist[80..88]), (88, &1u64.to_le_bytes()[..]));
+        // 图层记录：8、12、20、24 是 0；名字补齐到 4 字节；最长 255 个字。
+        for (_, id, rec) in chunks.iter().filter(|c| &c.0 == b"layr") {
+            assert_eq!(u32_at(rec, 4), *id);
+            assert!([8, 12, 20, 24].iter().all(|&at| u32_at(rec, at) == 0));
+            assert_eq!(&rec[56..60], b"name");
+            assert_eq!(u32_at(rec, 60) % 4, 0);
+        }
+        let long = chunks.iter().find(|c| &c.0 == b"layr" && c.1 == n + 1).unwrap().2;
+        assert_eq!(u16::from_le_bytes([long[64], long[65]]), 255);
+        // 像素：每条以类型 F 结束，列号是范围的右边；没有透明的类型 5。
+        for (tag, id, data) in chunks.iter().filter(|c| &c.0 == b"lpix") {
+            let rec = chunks.iter().find(|c| &c.0 == b"layr" && c.1 == *id).unwrap().2;
+            let (bx, bw, bh) = (u32_at(rec, 28) as i32, u32_at(rec, 36) as i32, u32_at(rec, 40) as usize);
+            if bh == 0 {
+                assert_eq!(*data, &[0u8; 4][..]);
+                continue;
+            }
+            let mut at = 4 + 4 * bh;
+            for k in 0..bh {
+                let s = &data[at..at + u32_at(data, 4 + 4 * k) as usize];
+                at += s.len();
+                assert_eq!(s[s.len() - 2..], [MARK, 0xF0 | (bx + bw).rem_euclid(16) as u8], "{} {id}", String::from_utf8_lossy(tag));
+                let mut p = 0;
+                while s[p + 1] >> 4 != 0xF {
+                    match s[p + 1] >> 4 {
+                        0 => p += 4,
+                        5 => {
+                            assert_ne!(&s[p + 8..p + 10], &[0, 0]);
+                            p += 10;
+                        }
+                        _ => p += 4 + u16::from_le_bytes([s[p + 2], s[p + 3]]) as usize,
+                    }
+                }
+            }
+        }
+        // 一种颜色的那层：一条里是 类型 5、类型 0（空一块）、类型 5，再 F。
+        let solid = chunks.iter().find(|c| &c.0 == b"lpix" && c.1 == 3).unwrap().2;
+        assert_eq!(&solid[8..8 + 2], &[MARK, 0x51]);
+        assert_eq!(&solid[18..22], &[MARK, 0x02, 0, 0]);
+    }
+
+    #[test]
+    fn merged_image_is_our_composite() {
+        let doc = rich_document();
+        let dir = Temp::new("sai2-merged");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("m.sai2");
+        save(&doc, &path).unwrap();
+        let (w, h, rgba, alpha) = merged(&path).unwrap();
+        assert_eq!((w, h, alpha), (200, 130, true));
+        assert!(rgba == doc.flatten_rgba());
+    }
+
+    #[test]
+    fn what_the_format_cannot_hold_is_drawn_or_dropped() {
+        let (w, h) = (100, 70);
+        let mut solid = Layer::new("纯色");
+        solid.kind = Kind::Fill(Fill { paint: Paint::Solid([200, 100, 50]), psd: None });
+        let mut mask = Mask::white();
+        set_mask(&mut mask, 5, 5, 0);
+        solid.mask = Some(mask);
+        let mut gradient = Layer::new("渐变");
+        gradient.kind = Kind::Fill(Fill { paint: Paint::Other, psd: None });
+        let mut styled = Layer::new("有样式");
+        set_pixel(&mut styled, 1, 1, [ONE as u16; 4]);
+        styled.style = Some(crate::style::Style { psd: Vec::new(), effects: Vec::new(), enabled: true, switch_at: None, light: None });
+        styled.props = LayerProps { fill: 0.5, opacity: 0.8, shapes: false, ..styled.props };
+        let mut board = Layer::folder("画板");
+        board.artboard = Some(Artboard { rect: None, background: None, psd: Vec::new() });
+        let doc = Document::from_layers(w, h, [10, 20, 30], vec![solid, gradient, styled, board]);
+        let (back, notes, _) = round_trip(&doc);
+        assert_eq!(notes.len(), 6, "{notes:?}");
+        // 背景色不是白的：最底下多一层"背景"，铺满画布。
+        let names: Vec<&str> = back.layers().iter().map(|l| l.props.name.as_str()).collect();
+        assert_eq!(names, [background_name(), "纯色", "渐变", "有样式", "画板"]);
+        let bg = pixel_of(&back.layers()[0], w - 1, h - 1);
+        assert_eq!(bg[3], ONE as u16);
+        assert!(bg[..3].iter().zip([10u32, 20, 30]).all(|(&v, c)| (v as i64 - (c * ONE / 255) as i64).abs() <= 2), "{bg:?}");
+        assert_eq!(pixel_of(&back.layers()[0], w, 0), [0; 4]);
+        // 纯色的填充图层画成铺满画布的像素，蒙版照样在。
+        let fill = &back.layers()[1];
+        assert!(fill.is_pixels() && fill.mask.is_some());
+        assert_eq!(pixel_of(fill, 0, 0)[3], ONE as u16);
+        assert_eq!(pixel_of(fill, w - 1, h - 1), pixel_of(fill, 0, 0));
+        assert_eq!(mask_value(fill.mask.as_ref().unwrap(), 5, 5), 0);
+        // 画不出来的是空的；填充不透明度乘进不透明度；画板是普通的组。
+        assert!(back.layers()[2].is_pixels() && back.layers()[2].tiles.is_empty());
+        assert_eq!(back.layers()[3].props.opacity, 0.4);
+        assert!(back.layers()[4].is_folder());
+        // 背景色是白的就不加图层。
+        let white = Document::from_layers(w, h, [255; 3], vec![Layer::new("一")]);
+        assert_eq!(round_trip(&white).0.layers().len(), 1);
+    }
+
+    #[test]
+    fn encoder_handles_the_extremes() {
+        // 差最大（0 和 0x4000 交替）、很长的一串 0、一串正好 8 个和 7 个 0。
+        let mut v = vec![0i32; SAMPLES];
+        for (k, x) in v.iter_mut().enumerate() {
+            *x = match k {
+                0..=63 => if k % 2 == 0 { FULL } else { 0 },
+                64..=71 => 0,
+                72..=78 => 5,
+                _ => 0,
+            };
+        }
+        let mut bits = Bits { data: &coded_block(&[v.clone()]), pos: 0 };
+        let mut back = [0i32; SAMPLES];
+        residuals(&mut bits, &mut back).unwrap();
+        unpredict(&mut back, BLOCK, FULL);
+        assert_eq!(back.to_vec(), v);
+        // 合并图像：画布宽高不是 256 的倍数，两行两列格子。
+        let (w, h) = (300, 260);
+        let mut rng = Rng(7);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|_| rng.pixel8()).collect();
+        let dir = Temp::new("sai2-intg");
+        let bytes = file(w as u32, h as u32, &[(b"intg", 0, encode_merged(w, h, &rgba))]);
+        std::fs::write(&dir.0, bytes).unwrap();
+        let (_, _, got, alpha) = merged(&dir.0).unwrap();
+        assert!(alpha && got == rgba);
+    }
+
+    /// 混合模式的边角：八种模式（色相、饱和度、颜色、明度、深色、浅色、亮光、实色混合）各一个不透明的图层，
+    /// 14 种底色 × 14 种源色，每格 4×4 像素，都是 8 位里正好的值。颜色里有灰（没有色相）、0 和 255 的分量、
+    /// "加起来"和"亮度"比出来不一样的两种颜色（实现方案 §3.17 的注）。
+    fn edge_document() -> Document {
+        const COLORS: [[u8; 3]; 14] = [
+            [0, 0, 0],
+            [255, 255, 255],
+            [128, 128, 128],
+            [64, 64, 64],
+            [255, 0, 0],
+            [0, 0, 255],
+            [0, 255, 0],
+            [60, 60, 60],
+            [200, 100, 50],
+            [10, 200, 240],
+            [255, 255, 0],
+            [128, 0, 255],
+            [1, 254, 128],
+            [127, 128, 129],
+        ];
+        const MODES: [BlendMode; 8] = [
+            BlendMode::Hue,
+            BlendMode::Saturation,
+            BlendMode::Color,
+            BlendMode::Luminosity,
+            BlendMode::DarkerColor,
+            BlendMode::LighterColor,
+            BlendMode::VividLight,
+            BlendMode::HardMix,
+        ];
+        let (cell, side) = (4, 4 * COLORS.len() as i32);
+        let px = |c: [u8; 3]| [c[0], c[1], c[2]].map(|v| ((v as u32 * ONE + 127) / 255) as u16);
+        let mut bottom = Layer::new("底");
+        let mut layers = Vec::new();
+        for (k, mode) in MODES.into_iter().enumerate() {
+            let (ox, oy) = ((k as i32 % 4) * side, (k as i32 / 4) * side);
+            let mut l = Layer::new(&format!("{mode:?}"));
+            l.props.blend = mode;
+            for (i, b) in COLORS.iter().enumerate() {
+                for (j, s) in COLORS.iter().enumerate() {
+                    for y in 0..cell {
+                        for x in 0..cell {
+                            let (x, y) = (ox + j as i32 * cell + x, oy + i as i32 * cell + y);
+                            let [r, g, bl] = px(*b);
+                            set_pixel(&mut bottom, x, y, [r, g, bl, ONE as u16]);
+                            let [r, g, bl] = px(*s);
+                            set_pixel(&mut l, x, y, [r, g, bl, ONE as u16]);
+                        }
+                    }
+                }
+            }
+            layers.push(l);
+        }
+        layers.insert(0, bottom);
+        Document::from_layers(4 * side, 2 * side, [255; 3], layers)
+    }
+
+    /// 给参照软件打开用的文件（内容都是我们生成的）：`ZHIBI_SAI2_SAMPLES` 里的 blocks.png、layers.psd、modes.psd
+    /// （参照软件以前从它们转存过样本）各存一份，再加上 `rich_document`。写到 `ZHIBI_SAI2_OUT` 目录。
+    #[test]
+    #[ignore]
+    fn write_files_for_the_reference() {
+        let samples = PathBuf::from(std::env::var("ZHIBI_SAI2_SAMPLES").expect("用 ZHIBI_SAI2_SAMPLES 指定样本目录"));
+        let out = PathBuf::from(std::env::var("ZHIBI_SAI2_OUT").expect("用 ZHIBI_SAI2_OUT 指定输出目录"));
+        std::fs::create_dir_all(&out).unwrap();
+        let blocks = crate::image::load(&samples.join("blocks.png")).unwrap().0;
+        let layers = crate::psd::load(&samples.join("layers.psd")).unwrap().0;
+        let modes = crate::psd::load(&samples.join("modes.psd")).unwrap().0;
+        for (name, doc) in [("blocks", blocks), ("layers", layers), ("modes", modes), ("rich", rich_document()), ("edges", edge_document())] {
+            let notes = save(&doc, &out.join(format!("{name}.sai2"))).unwrap();
+            eprintln!("{name}: {} 层，说明 {notes:?}", doc.layers().len());
+        }
+    }
+
+    /// 两个文件的图层是不是一样（个数、属性、像素、蒙版），只出数字。参照软件打开我们写的文件再存一次，拿来和我们写的比。
+    /// `ZHIBI_SAI2_COMPARE` 是一个，`ZHIBI_SAI2_OTHER` 是另一个。
+    #[test]
+    #[ignore]
+    fn same_layers_as_other() {
+        let a = load(&PathBuf::from(std::env::var("ZHIBI_SAI2_COMPARE").unwrap())).unwrap().0;
+        let b = load(&PathBuf::from(std::env::var("ZHIBI_SAI2_OTHER").unwrap())).unwrap().0;
+        eprintln!("{} 层 / {} 层，当前图层 {} / {}", a.layers().len(), b.layers().len(), a.active(), b.active());
+        let keep = a.keep_bounds();
+        for (i, (x, y)) in a.layers().iter().zip(b.layers()).enumerate() {
+            let (p, q) = (&x.props, &y.props);
+            let props = (&p.name, p.opacity, p.visible, p.blend, p.lock_alpha, p.clip, p.pass_through, x.depth, &x.kind)
+                == (&q.name, q.opacity, q.visible, q.blend, q.lock_alpha, q.clip, q.pass_through, y.depth, &y.kind);
+            let mut pixels = 0;
+            let mut masks = 0;
+            for py in keep.y0..keep.y1 {
+                for px in keep.x0..keep.x1 {
+                    pixels += (pixel_of(x, px, py) != pixel_of(y, px, py)) as usize;
+                    if let (Some(m), Some(n)) = (&x.mask, &y.mask) {
+                        masks += (mask_value(m, px, py) != mask_value(n, px, py)) as usize;
+                    }
+                }
+            }
+            let mask_kind = (x.mask.as_ref().map(|m| (m.default, m.disabled)), y.mask.as_ref().map(|m| (m.default, m.disabled)));
+            if !props || pixels > 0 || masks > 0 || mask_kind.0 != mask_kind.1 {
+                eprintln!("  #{i} {:?}：属性一样 {props}，不同的像素 {pixels}，蒙版 {mask_kind:?} 不同的值 {masks}", p.name);
+                if !props {
+                    eprintln!("     {:?} {} {} {:?} {} {} {} {} {:?}", p.name, p.opacity, p.visible, p.blend, p.lock_alpha, p.clip, p.pass_through, x.depth, x.kind);
+                    eprintln!("     {:?} {} {} {:?} {} {} {} {} {:?}", q.name, q.opacity, q.visible, q.blend, q.lock_alpha, q.clip, q.pass_through, y.depth, y.kind);
+                }
+            }
+        }
+    }
+
+    /// 读用户的一个文件、存成这种格式、再读回来：图层、属性、像素、蒙版都应该一样（文件里的值是偶数，来回一位不差）。
+    /// 只出数字。`ZHIBI_SAI2_COMPARE` 指文件；`ZHIBI_SAI2_OUT` 指定写到哪里（不给就写到临时目录，用完删掉）。
+    #[test]
+    #[ignore]
+    fn rewrite_user_file() {
+        let path = PathBuf::from(std::env::var("ZHIBI_SAI2_COMPARE").expect("用 ZHIBI_SAI2_COMPARE 指定文件"));
+        let started = std::time::Instant::now();
+        let (doc, _) = load(&path).unwrap();
+        let loaded = started.elapsed();
+        let temp = Temp::new("sai2-rewrite.sai2");
+        let out = std::env::var("ZHIBI_SAI2_OUT").map(PathBuf::from).unwrap_or_else(|_| temp.0.clone());
+        let started = std::time::Instant::now();
+        let notes = save(&doc, &out).unwrap();
+        let saved = started.elapsed();
+        let (back, _) = load(&out).unwrap();
+        let size = |p: &Path| std::fs::metadata(p).unwrap().len() as f64 / 1e6;
+        eprintln!(
+            "{}×{}，{} 层；读 {:.0} 毫秒，写 {:.0} 毫秒；原文件 {:.1} MB，写出 {:.1} MB；说明 {notes:?}",
+            doc.width,
+            doc.height,
+            doc.layers().len(),
+            loaded.as_secs_f64() * 1000.0,
+            saved.as_secs_f64() * 1000.0,
+            size(&path),
+            size(&out)
+        );
+        assert_eq!((back.layers().len(), back.active()), (doc.layers().len(), doc.active()));
+        let same_tiles = |a: &TileMap, b: &TileMap| {
+            a.coords().chain(b.coords()).all(|tc| {
+                let get = |m: &TileMap| m.get(tc).map(|t| t.0.clone()).unwrap_or_else(|| vec![0; (TILE * TILE * 4) as usize]);
+                get(a) == get(b)
+            })
+        };
+        let mut wrong = Vec::new();
+        for (i, (a, b)) in doc.layers().iter().zip(back.layers()).enumerate() {
+            let (p, q) = (&a.props, &b.props);
+            let props_same = (&p.name, p.opacity, p.visible, p.blend, p.lock_alpha, p.clip, p.pass_through, a.depth, &a.kind)
+                == (&q.name, q.opacity, q.visible, q.blend, q.lock_alpha, q.clip, q.pass_through, b.depth, &b.kind);
+            let mask_same = match (&a.mask, &b.mask) {
+                (None, None) => true,
+                (Some(m), Some(n)) => {
+                    let keep = doc.keep_bounds();
+                    (m.default, m.disabled) == (n.default, n.disabled)
+                        && m.tiles.coords().chain(n.tiles.coords()).all(|(tx, ty)| {
+                            (0..TILE * TILE).all(|k| {
+                                let (x, y) = (tx * TILE + k % TILE, ty * TILE + k / TILE);
+                                !(keep.x0..keep.x1).contains(&x) || !(keep.y0..keep.y1).contains(&y) || mask_value(m, x, y) == mask_value(n, x, y)
+                            })
+                        })
+                }
+                _ => false,
+            };
+            if !props_same || !mask_same || !same_tiles(&a.tiles, &b.tiles) {
+                wrong.push(format!("#{i} 属性 {props_same} 蒙版 {mask_same}"));
+            }
+        }
+        assert!(wrong.is_empty(), "不一样的图层：{wrong:?}");
+        let (_, _, rgba, _) = merged(&out).unwrap();
+        assert!(rgba == back.flatten_rgba(), "写进去的合并图像不是我们的合成结果");
     }
 
     /// 和文件里存的合并图像对照：只出数字（差的分布），不看画面。`ZHIBI_SAI2_COMPARE` 指文件。
