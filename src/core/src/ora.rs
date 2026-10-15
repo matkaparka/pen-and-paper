@@ -67,7 +67,8 @@ const MAX_OFFSET: i64 = 1 << 40;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// 混合模式在 `stack.xml` 里的名字（`composite-op` 属性）。
-const COMPOSITE_OPS: [(BlendMode, &str); 8] = [
+/// 规范里没有的模式（线性加深、亮光、线性光、点光、实色混合、减去、划分、深色、浅色）导出时写成普通覆盖。
+const COMPOSITE_OPS: [(BlendMode, &str); 17] = [
     (BlendMode::Normal, "svg:src-over"),
     (BlendMode::Multiply, "svg:multiply"),
     (BlendMode::Screen, "svg:screen"),
@@ -76,6 +77,15 @@ const COMPOSITE_OPS: [(BlendMode, &str); 8] = [
     (BlendMode::Lighten, "svg:lighten"),
     (BlendMode::Add, "svg:plus"),
     (BlendMode::Difference, "svg:difference"),
+    (BlendMode::ColorBurn, "svg:color-burn"),
+    (BlendMode::ColorDodge, "svg:color-dodge"),
+    (BlendMode::SoftLight, "svg:soft-light"),
+    (BlendMode::HardLight, "svg:hard-light"),
+    (BlendMode::Exclusion, "svg:exclusion"),
+    (BlendMode::Hue, "svg:hue"),
+    (BlendMode::Saturation, "svg:saturation"),
+    (BlendMode::Color, "svg:color"),
+    (BlendMode::Luminosity, "svg:luminosity"),
 ];
 
 fn composite_op(mode: BlendMode) -> &'static str {
@@ -122,7 +132,9 @@ fn write_archive(doc: &Document, file: File) -> io::Result<()> {
             open += 1;
         } else {
             xml.push_str(&indent);
-            push_layer_element(&mut xml, &layer.props, &file_name(i), (r.x0, r.y0));
+            // ORA 没有填充不透明度：乘进不透明度里（普通的混合模式下一样，PS 那八种模式只是近似）。
+            let props = LayerProps { opacity: layer.props.opacity * layer.props.fill.clamp(0.0, 1.0), ..layer.props.clone() };
+            push_layer_element(&mut xml, &props, &file_name(i), (r.x0, r.y0));
         }
     }
     while open > 0 {
@@ -1927,7 +1939,7 @@ mod tests {
     <stack name="组" opacity="0.5" visibility="hidden" composite-op="svg:screen">
       <layer name="组里的灰度" src="data/grey.png" x="10" y="10" opacity="0.5"></layer>
       <stack name="内层组" isolation="auto" composite-op="svg:difference">
-        <layer src="data/palette.png" x="98" y="0" visibility="visible" composite-op="svg:color-dodge"/>
+        <layer src="data/palette.png" x="98" y="0" visibility="visible" composite-op="svg:dst-in"/>
       </stack>
       <text x="1" y="2">这种元素不认识</text>
     </stack>
@@ -2008,7 +2020,7 @@ mod tests {
         assert_eq!(notes.len(), 3, "{notes:?}");
         expect_note(&notes, "不认识的内容：<text>");
         expect_note(&notes, "不是 PNG，已跳过：“矢量”");
-        expect_note(&notes, "混合模式本程序没有，已改为“正常”：“图层 3（svg:color-dodge）”");
+        expect_note(&notes, "混合模式本程序没有，已改为“正常”：“图层 3（svg:dst-in）”");
         // 伸出画布的部分留着（实现方案 §3.15）：调色板图层右边出界的那个蓝像素，16 位图层左边和下边出界的部分。
         assert_eq!(pixel(layer(1), 101, 0), [0, 0, ONE as u16, ONE as u16]);
         assert_eq!(pixel(layer(3), -3, 89), [16384, 0, 0, 16384]);
@@ -2139,7 +2151,7 @@ mod tests {
     fn notes_and_errors_in_english() {
         // 一个图层组、一个不认识的元素、一张不是 PNG 的图、两个出界的图层（其中一个混合模式不认识）、一个没名字的图层。
         let xml = r#"<image w="10" h="10" xres="300" yres="72"><stack>
-            <stack><layer name="上" src="a.png" x="9" composite-op="svg:hue"/></stack>
+            <stack><layer name="上" src="a.png" x="9" composite-op="svg:dst-in"/></stack>
             <layer name="下" src="a.png" y="-1"/>
             <layer src="b.png"/>
             <layer name="矢量" src="c.svg"/>
@@ -2156,7 +2168,7 @@ mod tests {
                 "The file has different horizontal and vertical resolutions (300 and 72 dpi); kept the horizontal one",
                 "Ignored unknown content in stack.xml: <text>",
                 r#"Skipped layers whose image is not a PNG: "矢量""#,
-                r#"Layers whose blend mode this program does not have were set to Normal: "上 (svg:hue)""#,
+                r#"Layers whose blend mode this program does not have were set to Normal: "上 (svg:dst-in)""#,
             ]
         );
 

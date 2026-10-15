@@ -333,7 +333,9 @@ impl Document {
         }
         let lower = upper - 1;
         let styled = |l: &Layer| l.style.as_ref().is_some_and(|s| s.shows());
-        if styled(&self.layers[upper]) || styled(&self.layers[lower]) {
+        // 带样式的、"透明形状图层"关着的 PS 那八种模式：按显示时的合成方法合并，结果和合并前看起来一样。
+        let shapeless = !self.layers[upper].props.shapes && neutral(self.layers[upper].props.blend).is_some();
+        if styled(&self.layers[upper]) || styled(&self.layers[lower]) || shapeless {
             return self.merge_styled(upper, lower);
         }
         let src = &self.layers[upper];
@@ -341,6 +343,7 @@ impl Document {
         // 上层剪贴在下层上时，合并进去的只是它露出来的那部分。
         let masked = src.props.clip && !dst.props.clip;
         let opacity = (src.props.opacity.clamp(0.0, 1.0) * ONE as f32) as u32;
+        let upper_fill = (src.props.fill.clamp(0.0, 1.0) * ONE as f32).round() as u32;
         let src_fill = match &src.kind {
             Kind::Fill(f) if f.paint != Paint::Other => Some(fill_pixels(f)),
             _ => None,
@@ -378,6 +381,7 @@ impl Document {
                 if let Some(m) = &s_mask {
                     sp = sp.map(|v| mul15(v as u32, m[i] as u32) as u16);
                 }
+                sp = with_fill(sp, upper_fill, src.props.blend);
                 if masked {
                     let a = dp[3];
                     sp = sp.map(|v| mul15(v as u32, a) as u16);
@@ -412,11 +416,12 @@ impl Document {
         true
     }
 
-    /// 向下合并时两层里有带样式的：两层单独合成一张图（效果画进去，和 PS 一样），结果保留下层的属性，
+    /// 向下合并时两层里有带样式的（或者上层是"透明形状图层"关着的那八种模式）：两层单独合成一张图
+    /// （效果画进去，和 PS 一样），结果保留下层的属性，
     /// 蒙版、样式都已经画进去，去掉。下层自己的不透明度、混合模式不画进去，照旧作为属性留着。
     fn merge_styled(&mut self, upper: usize, lower: usize) -> bool {
         let mut a = self.layers[lower].clone();
-        a.props = LayerProps { opacity: 1.0, blend: BlendMode::Normal, visible: true, clip: false, ..a.props.clone() };
+        a.props = LayerProps { opacity: 1.0, fill: 1.0, shapes: true, blend: BlendMode::Normal, visible: true, clip: false, ..a.props.clone() };
         a.depth = 0;
         let mut b = self.layers[upper].clone();
         b.depth = 0;

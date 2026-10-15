@@ -21,12 +21,13 @@
 - **移动与自由变换**：手柄在画布上，确定和取消在面板里，全程没有对话框。除了缩放、旋转，还能扭曲（四个角各自拖，做透视）、斜切和网格变形（拖网格上的点把画面弯过去）。
 - **液化**：推、顺时针转、逆时针转、收缩、膨胀、复原；确定之前每一笔都能撤销，画多少笔都不会越画越糊。
 - **滤镜**：只有三个，色相/饱和度、亮度/对比度、模糊，拖滑块时画布实时变化，不弹对话框。
-- **图层**：8 种混合模式、不透明度、保护不透明度、锁定、剪贴、向下合并、合并可见图层、拼合、白底变透明。图层列表里按住一行拖动就能排顺序。
+- **图层**：26 种混合模式（和 PS 一样，溶解除外）、不透明度、填充（PS 的"填充"，读 PSD 时照 PS 的样子起作用）、保护不透明度、锁定、剪贴、向下合并、合并可见图层、拼合、白底变透明。图层列表里按住一行拖动就能排顺序，拖到列表上下边上会自己滚。
 - **文件夹**：可以套好几层，能折叠；普通的先合成再叠上去，"穿透"的和没有文件夹时一样。移动、自由变换文件夹时里面的图层一起变。
 - **蒙版**：每个图层、文件夹都可以有一个蒙版，点图层行右边的"蒙"就在蒙版上画（黑处隐藏、白处显示），可以停用、应用、删除。
 - **填充图层**：PSD 里的纯色填充图层读进来还是填充图层，可以换成前景色，也可以栅格化。
 - **图层样式**：PSD 里的图层样式原样保留，存回 PSD 时一个字节不差；其中投影、外发光、内发光画出来（照 PS 的结果校准过），可以在面板上关掉、打开。参数不能改。
 - **画布外的内容**：伸出画布的部分不裁掉，存回去照样有，移动、变换时跟着走。
+- **画板**：PS 的画板读进来是一个组，背景色和范围照样画，存回 PSD 还是画板。
 - **视图**：以光标为中心缩放、旋转、镜像，按住空格平移。
 - **文件**：自己的格式 `.zhibi`（压缩包里是 JSON 和逐层 PNG，每通道 15 位精度）；PSD、ORA 的打开和导出，文件夹、蒙版、填充图层都保留（ORA 没有蒙版和填充图层，导出时画进像素）；导出 PNG。
 - **其他**：快捷键可以改；按住工具键画一笔再松开是临时借用这个工具；笔身按键切到橡皮时自动换成橡皮；Windows 笔输入和 Wintab 都支持；中文、英文界面。
@@ -86,12 +87,13 @@ Pen & Paper does one thing: drawing and painting — sketching, inking and colou
 - **Move and free transform** with on-canvas handles and OK/Cancel in the panel — no dialogs. Besides scaling and rotating: distort (drag each corner on its own, for perspective), skew, and mesh warp (drag points on a grid to bend the picture).
 - **Liquify**: push, twirl clockwise or counter-clockwise, pinch, bloat, restore. Every stroke can be undone until you apply, and the picture never gets blurrier however many strokes you make.
 - **Filters**: just three — hue/saturation, brightness/contrast, blur — with the canvas updating as you drag the sliders, no dialogs.
-- **Layers**: 8 blend modes, opacity, protect opacity, lock, clipping, merge down, merge visible, flatten, white to transparent. Drag a row in the layer list to reorder.
+- **Layers**: 26 blend modes (Photoshop's set except Dissolve), opacity, fill (Photoshop's *Fill*, applied the way Photoshop does when reading PSD files), protect opacity, lock, clipping, merge down, merge visible, flatten, white to transparent. Drag a row in the layer list to reorder; the list scrolls when you hold it at the top or bottom edge.
 - **Folders**, nested as deep as you like and collapsible; a normal folder is composited first and then laid on top, a *pass-through* one looks the same as having no folder. Moving or transforming a folder moves everything in it.
 - **Masks**: every layer and folder can have one. Click the *M* at the right of a layer row to paint on the mask (black hides, white shows); masks can be disabled, applied or deleted.
 - **Fill layers**: solid colour fill layers from PSD files stay fill layers; you can switch one to the foreground colour or rasterize it.
 - **Layer styles** from PSD files are kept byte for byte when saved back; drop shadows, outer glows and inner glows are drawn (calibrated against Photoshop's own result) and can be switched off and on in the panel. Their settings can't be edited.
 - **Content outside the canvas** is kept, saved back, and follows the layer when you move or transform it.
+- **Artboards** from Photoshop become groups that keep the artboard's background colour and bounds, and stay artboards when saved back to PSD.
 - **View**: zoom at the cursor, rotate, mirror, hold Space to pan.
 - **Files**: own format `.zhibi` (a ZIP with JSON and one PNG per layer, 15 bits per channel); open and export PSD and ORA, keeping folders, masks and fill layers (ORA has no masks or fill layers, so those are painted into the pixels on export); export PNG.
 - **More**: customizable shortcuts; hold a tool key, draw, release to borrow a tool for one stroke; switches to the eraser when the pen's button flips it to eraser mode; Windows Ink and Wintab pen input; Chinese and English interface.

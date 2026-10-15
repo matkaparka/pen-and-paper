@@ -13,6 +13,8 @@
 //!   有蒙版的有 `mask`：`x` `y` `width` `height` `file`（同上）、矩形以外的值 `default`（`"white"` 或
 //!   `"black"`）和 `disabled`。有图层样式的有 `style`：PS 原来的块 `psd`（`key` 和 Base64 的 `data` 的列表）、
 //!   `enabled`、文件的全局光 `light`（角度、高度，没有就是 `null`）；读的时候照 PSD 的样子重新解析。
+//!   PS 的画板（组）有 `artboard`：原来的块 `psd`（同上），读的时候重新解析。
+//!   填充不透明度不是 1 的有 `fill_opacity`（0 到 1），透明形状图层关着的有 `"shapes": false`。
 //!   图层、蒙版的矩形可以伸出画布（不超过画布四周各一个画布的宽和高）。
 //! - `layers/NNNN.png`：一个图层的像素，16 位 RGBA、非预乘透明度（PNG 的规定），只含有内容的那块矩形。
 //! - `masks/NNNN.png`：一个图层的蒙版，16 位灰度。
@@ -164,6 +166,12 @@ fn write_archive(doc: &Document, file: File) -> io::Result<()> {
                 "height": r.y1 - r.y0,
                 "file": name,
             });
+            if layer.props.fill < 1.0 {
+                v["fill_opacity"] = json!(opacity_number(layer.props.fill));
+            }
+            if !layer.props.shapes {
+                v["shapes"] = json!(false);
+            }
             match &layer.kind {
                 Kind::Pixels => v["kind"] = json!("pixels"),
                 Kind::Folder { open } => {
@@ -180,6 +188,10 @@ fn write_archive(doc: &Document, file: File) -> io::Result<()> {
                         v["psd"] = json!({ "key": String::from_utf8_lossy(key), "data": base64(data) });
                     }
                 }
+            }
+            if let Some(board) = &layer.artboard {
+                let blocks: Vec<Value> = board.psd.iter().map(|(k, d)| json!({ "key": String::from_utf8_lossy(k), "data": base64(d) })).collect();
+                v["artboard"] = json!({ "psd": blocks });
             }
             if let Some(st) = &layer.style {
                 let blocks: Vec<Value> = st.psd.iter().map(|(k, d)| json!({ "key": String::from_utf8_lossy(k), "data": base64(d) })).collect();
@@ -450,6 +462,7 @@ struct LayerEntry {
     depth: u16,
     mask: Option<MaskEntry>,
     style: Option<Style>,
+    artboard: Option<crate::document::Artboard>,
 }
 
 struct MaskEntry {
@@ -487,6 +500,7 @@ pub fn load(path: &Path) -> io::Result<Document> {
         layer.kind = entry.kind;
         layer.depth = entry.depth;
         layer.style = entry.style;
+        layer.artboard = entry.artboard;
         if let Some(m) = entry.mask {
             let mut mask = Mask { tiles: GrayMap::default(), default: m.default, disabled: m.disabled };
             if let Some(name) = &m.file {
@@ -681,6 +695,8 @@ fn parse_layer(v: &Value, index: usize, keep: Rect) -> io::Result<LayerEntry> {
         locked: flag("locked"),
         clip: flag("clip"),
         pass_through: flag("pass_through"),
+        fill: v.get("fill_opacity").and_then(Value::as_f64).map_or(1.0, |f| (f as f32).clamp(0.0, 1.0)),
+        shapes: v.get("shapes").and_then(Value::as_bool).unwrap_or(true),
     };
     // 图层样式：原始的块照 PSD 的样子重新解析；读不懂的块照样留着。
     let style = v.get("style").filter(|s| !s.is_null()).map(|s| {
@@ -699,7 +715,22 @@ fn parse_layer(v: &Value, index: usize, keep: Rect) -> io::Result<LayerEntry> {
         style.enabled = s.get("enabled").and_then(Value::as_bool).unwrap_or(true);
         style
     });
-    Ok(LayerEntry { props, rect, file, kind, depth, mask, style })
+    let blocks = |v: &Value| -> Vec<([u8; 4], Vec<u8>)> {
+        v.get("psd")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|b| Some((b.get("key")?.as_str()?.as_bytes().try_into().ok()?, unbase64(b.get("data")?.as_str()?)?)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let artboard = v.get("artboard").filter(|a| !a.is_null()).map(|a| {
+        let raw = blocks(a);
+        let refs: Vec<([u8; 4], &[u8])> = raw.iter().map(|(k, d)| (*k, d.as_slice())).collect();
+        crate::psd::parse_artboard(&refs)
+    });
+    Ok(LayerEntry { props, rect, file, kind, depth, mask, style, artboard })
 }
 
 /// `#RRGGBB` 写的颜色。

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::document::{BlendMode, Mask};
-use crate::tile::{TileCoord, TileMap, TILE};
+use crate::tile::{Tile, TileCoord, TileMap, TILE};
 use crate::{Rect, ONE};
 
 const N: usize = (TILE * TILE) as usize;
@@ -84,6 +84,10 @@ impl Style {
 pub struct Model {
     /// 高斯的标准差是模糊长度（大小减去扩展的部分）的几倍
     pub sigma_per_size: f32,
+    /// 用几次方框模糊逼近（次数越少，轮廓越像方框、尾巴越短）
+    pub passes: usize,
+    /// 内发光的标准差另算：是模糊长度的几倍
+    pub sigma_inner: f32,
     /// 发光的"范围"怎么作用在透明度上
     pub range: RangeRule,
 }
@@ -100,7 +104,7 @@ pub enum RangeRule {
 }
 
 /// 校准后定下来的画法。
-pub const PS_MODEL: Model = Model { sigma_per_size: 0.2, range: RangeRule::Scale };
+pub const PS_MODEL: Model = Model { sigma_per_size: 0.2, passes: 3, sigma_inner: 0.2, range: RangeRule::Scale };
 
 /// 当前用的画法：平时就是 `PS_MODEL`；校准的测试会临时换掉（换了以后缓存自动作废）。
 static MODEL: RwLock<(Model, u64)> = RwLock::new((PS_MODEL, 0));
@@ -117,46 +121,115 @@ pub fn set_model(m: Model) {
 
 /// 一个图层所有效果画好的透明度（0..=ONE，还没乘效果的不透明度），按分块存，只有画布里的；
 /// 和 `effects` 一一对应。
+#[derive(Clone)]
 pub struct Planes {
-    pub fx: Vec<HashMap<TileCoord, Vec<u16>>>,
+    pub fx: Vec<HashMap<TileCoord, Arc<Vec<u16>>>>,
 }
 
+/// 效果图怎么算的：这些一样，图层内容变了时才能只重算变了的那一片。
 #[derive(Clone, PartialEq)]
 struct Key {
-    tiles: u64,
-    mask: Option<(u64, u16, bool)>,
+    mask: Option<(u16, bool)>,
     effects: Vec<Effect>,
     canvas: Rect,
     model: u64,
 }
 
-/// 缓存里的一项：算的时候的键和算出来的效果图。
-type Entry = Option<(Key, Arc<Planes>)>;
+/// 缓存里的一项。
+struct Entry {
+    key: Key,
+    /// 算的时候分块表和蒙版的改动编号；都没变就直接用
+    revisions: (u64, u64),
+    /// 算的时候的各个分块。拿着它们，图层上再改这些分块时就会先复制一份（写时复制），
+    /// 和这里拿着的不再是同一块，对一对就知道哪些分块变了
+    tiles: HashMap<TileCoord, Arc<Tile>>,
+    mask: HashMap<TileCoord, Arc<Vec<u16>>>,
+    planes: Arc<Planes>,
+}
 
 /// 按图层存的效果缓存。复制图层时一起复制（共用同一份，键对不上会自己重算）。
 #[derive(Clone, Default)]
-pub struct Cache(Arc<Mutex<Entry>>);
+pub struct Cache(Arc<Mutex<Option<Entry>>>);
 
 impl Cache {
-    /// 这个图层的效果图：和上次算的时候一样就直接用，不一样就重算。几个线程同时要时只算一次。
+    /// 这个图层的效果图：和上次算的时候一样就直接用；只是一部分分块变了（画了一笔），就只重算
+    /// 那几块够得着的地方；别的情况整层重算。几个线程同时要时只算一次。
     pub fn get(&self, tiles: &TileMap, mask: Option<&Mask>, effects: &[Effect], canvas: Rect) -> Arc<Planes> {
         let (m, rev) = model();
-        let key = Key {
-            tiles: tiles.revision(),
-            mask: mask.filter(|m| !m.disabled).map(|m| (m.tiles.revision(), m.default, m.disabled)),
-            effects: effects.to_vec(),
-            canvas,
-            model: rev,
-        };
+        let mask = mask.filter(|m| !m.disabled);
+        let key = Key { mask: mask.map(|m| (m.default, m.disabled)), effects: effects.to_vec(), canvas, model: rev };
+        let revisions = (tiles.revision(), mask.map_or(0, |m| m.tiles.revision()));
         let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((k, p)) = g.as_ref() {
-            if *k == key {
-                return p.clone();
+        let now: HashMap<TileCoord, Arc<Tile>> = tiles.coords().map(|tc| (tc, tiles.get(tc).unwrap().clone())).collect();
+        let now_mask: HashMap<TileCoord, Arc<Vec<u16>>> =
+            mask.map(|m| m.tiles.coords().map(|tc| (tc, m.tiles.get(tc).unwrap().clone())).collect()).unwrap_or_default();
+        if let Some(e) = g.as_mut().filter(|e| e.key == key) {
+            if e.revisions == revisions {
+                return e.planes.clone();
+            }
+            // 哪些分块换了：地址不一样、多了、少了。
+            let changed: Vec<TileCoord> = differs(&e.tiles, &now).chain(differs(&e.mask, &now_mask)).collect();
+            if changed.len() * 4 <= now.len().max(e.tiles.len()).max(16) {
+                if !changed.is_empty() {
+                    let mut planes = (*e.planes).clone();
+                    let area = changed.iter().fold(Rect::EMPTY, |r, &tc| r.union(tile_rect(tc)));
+                    patch(&mut planes, tiles, mask, effects, canvas, &m, area);
+                    e.planes = Arc::new(planes);
+                }
+                e.revisions = revisions;
+                e.tiles = now;
+                e.mask = now_mask;
+                return e.planes.clone();
             }
         }
-        let p = Arc::new(render(tiles, mask.filter(|m| !m.disabled), effects, canvas, &m));
-        *g = Some((key, p.clone()));
-        p
+        let planes = Arc::new(render(tiles, mask, effects, canvas, &m));
+        *g = Some(Entry { key, revisions, tiles: now, mask: now_mask, planes: planes.clone() });
+        planes
+    }
+}
+
+/// 两份分块表里不是同一块的坐标（多了的、少了的也算）。
+fn differs<'a, T>(old: &'a HashMap<TileCoord, Arc<T>>, new: &'a HashMap<TileCoord, Arc<T>>) -> impl Iterator<Item = TileCoord> + 'a {
+    old.iter()
+        .filter(move |(tc, a)| new.get(tc).is_none_or(|b| !Arc::ptr_eq(a, b)))
+        .map(|(tc, _)| *tc)
+        .chain(new.keys().filter(move |tc| !old.contains_key(tc)).copied())
+}
+
+/// 形状在 `changed` 里变了：重算效果够得着的那一片（对齐到分块），换进 `planes`。
+/// 那一片外面的结果只取决于没变的形状，不用动。
+fn patch(planes: &mut Planes, tiles: &TileMap, mask: Option<&Mask>, effects: &[Effect], canvas: Rect, model: &Model, changed: Rect) {
+    let reach = effects.iter().map(|e| reach_of(e, model)).max().unwrap_or(0);
+    let near = grow(canvas, reach);
+    // 要重算的分块：变了的地方四周扩出效果能够到的距离，对齐到分块，只要画布里的。
+    let out = align(grow(changed, reach)).intersect(canvas);
+    if out.is_empty() {
+        return;
+    }
+    let coords: Vec<TileCoord> = crate::tile::tiles_in(out).collect();
+    let area = grow(align(out), reach).intersect(near);
+    let shape = shape(tiles, mask, area);
+    for (e, fx) in effects.iter().zip(&mut planes.fx) {
+        let plane = effect_plane(e, &shape, model);
+        for &tc in &coords {
+            match tile_values(&plane, tc, canvas) {
+                Some(t) => fx.insert(tc, Arc::new(t)),
+                None => fx.remove(&tc),
+            };
+        }
+    }
+}
+
+/// 扩到分块边界。
+fn align(r: Rect) -> Rect {
+    if r.is_empty() {
+        return r;
+    }
+    Rect {
+        x0: r.x0.div_euclid(TILE) * TILE,
+        y0: r.y0.div_euclid(TILE) * TILE,
+        x1: (r.x1 - 1).div_euclid(TILE) * TILE + TILE,
+        y1: (r.y1 - 1).div_euclid(TILE) * TILE + TILE,
     }
 }
 
@@ -221,7 +294,8 @@ fn reach_of(e: &Effect, model: &Model) -> i32 {
 fn split(e: &Effect, model: &Model) -> (f32, f32) {
     let size = e.size.max(0.0);
     let spread = e.spread.clamp(0.0, 1.0);
-    (size * spread, size * (1.0 - spread) * model.sigma_per_size)
+    let k = if e.below() { model.sigma_per_size } else { model.sigma_inner };
+    (size * spread, size * (1.0 - spread) * k)
 }
 
 fn effect_plane(e: &Effect, shape: &Plane, model: &Model) -> Plane {
@@ -230,7 +304,7 @@ fn effect_plane(e: &Effect, shape: &Plane, model: &Model) -> Plane {
         EffectKind::DropShadow { dx, dy, knockout } => {
             let mut p = shifted(shape, dx, dy);
             dilate(&mut p, grow_px);
-            blur(&mut p, sigma);
+            blur_with(&mut p, sigma, 0.0, model.passes);
             if knockout {
                 for (v, a) in p.v.iter_mut().zip(&shape.v) {
                     *v *= 1.0 - a;
@@ -241,7 +315,7 @@ fn effect_plane(e: &Effect, shape: &Plane, model: &Model) -> Plane {
         EffectKind::OuterGlow => {
             let mut p = Plane { area: shape.area, w: shape.w, v: shape.v.clone() };
             dilate(&mut p, grow_px);
-            blur(&mut p, sigma);
+            blur_with(&mut p, sigma, 0.0, model.passes);
             apply_range(&mut p, e.range, model.range);
             p
         }
@@ -249,7 +323,7 @@ fn effect_plane(e: &Effect, shape: &Plane, model: &Model) -> Plane {
             // 从边缘发：形状外面（1 − A）扩张、模糊，伸进形状里的部分就是发光。
             let mut p = Plane { area: shape.area, w: shape.w, v: shape.v.iter().map(|a| 1.0 - a).collect() };
             dilate(&mut p, grow_px);
-            blur_with(&mut p, sigma, 1.0);
+            blur_with(&mut p, sigma, 1.0, model.passes);
             apply_range(&mut p, e.range, model.range);
             for (v, a) in p.v.iter_mut().zip(&shape.v) {
                 *v = if center { (1.0 - *v) * a } else { *v * a };
@@ -400,18 +474,13 @@ fn max_filter(src: &[f32], r: usize, out: &mut Vec<f32>) {
     out.extend((0..n).map(|i| suf[i].max(pre[i + k - 1])));
 }
 
-/// 近似高斯模糊：三次方框模糊，图外当 0。
-fn blur(p: &mut Plane, sigma: f32) {
-    blur_with(p, sigma, 0.0);
-}
-
-/// 同 `blur`，图外的值是 `outside`。
-fn blur_with(p: &mut Plane, sigma: f32, outside: f32) {
+/// 近似高斯模糊：`passes` 次方框模糊，图外的值是 `outside`。
+fn blur_with(p: &mut Plane, sigma: f32, outside: f32, passes: usize) {
     if sigma < 0.3 {
         return;
     }
-    // 三个方框先都沿行做、再都沿列做：两个方向的运算互不相干，先后不影响结果。
-    let radii = box_radii(sigma);
+    // 几个方框先都沿行做、再都沿列做：两个方向的运算互不相干，先后不影响结果。
+    let radii = box_radii(sigma, passes);
     separable(p, |line, out| {
         let mut a = line.to_vec();
         for &r in &radii {
@@ -422,9 +491,10 @@ fn blur_with(p: &mut Plane, sigma: f32, outside: f32) {
     });
 }
 
-/// 三次方框模糊逼近标准差 σ 的高斯时，三个方框的半径（宽度是 2r + 1）。
-fn box_radii(sigma: f32) -> [usize; 3] {
-    let n = 3.0;
+/// `count` 次方框模糊合起来的标准差是 σ 时，各个方框的半径（宽度是 2r + 1）。
+fn box_radii(sigma: f32, count: usize) -> Vec<usize> {
+    let count = count.max(1);
+    let n = count as f32;
     let ideal = (12.0 * sigma * sigma / n + 1.0).sqrt();
     let mut wl = ideal.floor() as i64;
     if wl % 2 == 0 {
@@ -432,7 +502,7 @@ fn box_radii(sigma: f32) -> [usize; 3] {
     }
     let wu = wl + 2;
     let m = ((12.0 * sigma * sigma - n * (wl * wl) as f32 - 4.0 * n * wl as f32 - 3.0 * n) / (-4.0 * wl as f32 - 4.0)).round() as i64;
-    let mut out = [0usize; 3];
+    let mut out = vec![0usize; count];
     for (i, r) in out.iter_mut().enumerate() {
         let width = if (i as i64) < m { wl } else { wu };
         *r = ((width.max(1) - 1) / 2) as usize;
@@ -455,32 +525,23 @@ fn box_filter(src: &[f32], r: usize, outside: f32, out: &mut Vec<f32>) {
 }
 
 /// 只留画布里的分块，0..=1 换成 0..=ONE；全是 0 的分块不存。
-fn to_tiles(p: &Plane, canvas: Rect) -> HashMap<TileCoord, Vec<u16>> {
-    let mut out = HashMap::new();
-    let area = p.area.intersect(canvas);
-    if area.is_empty() {
-        return out;
-    }
-    let (tx0, ty0) = (area.x0.div_euclid(TILE), area.y0.div_euclid(TILE));
-    let (tx1, ty1) = ((area.x1 - 1).div_euclid(TILE), (area.y1 - 1).div_euclid(TILE));
-    for ty in ty0..=ty1 {
-        for tx in tx0..=tx1 {
-            let r = tile_rect((tx, ty)).intersect(area);
-            let mut t = vec![0u16; N];
-            let mut any = false;
-            for y in r.y0..r.y1 {
-                for x in r.x0..r.x1 {
-                    let v = (p.at(x, y, 0.0).clamp(0.0, 1.0) * ONE as f32).round() as u16;
-                    any |= v != 0;
-                    t[((y - ty * TILE) * TILE + (x - tx * TILE)) as usize] = v;
-                }
-            }
-            if any {
-                out.insert((tx, ty), t);
-            }
+fn to_tiles(p: &Plane, canvas: Rect) -> HashMap<TileCoord, Arc<Vec<u16>>> {
+    crate::tile::tiles_in(p.area.intersect(canvas)).filter_map(|tc| tile_values(p, tc, canvas).map(|t| (tc, Arc::new(t)))).collect()
+}
+
+/// 分块 tc 在画布里的那部分的值（0..=ONE）；全是 0 时是 None。
+fn tile_values(p: &Plane, tc: TileCoord, canvas: Rect) -> Option<Vec<u16>> {
+    let r = tile_rect(tc).intersect(canvas).intersect(p.area);
+    let mut t = vec![0u16; N];
+    let mut any = false;
+    for y in r.y0..r.y1 {
+        for x in r.x0..r.x1 {
+            let v = (p.at(x, y, 0.0).clamp(0.0, 1.0) * ONE as f32).round() as u16;
+            any |= v != 0;
+            t[((y - tc.1 * TILE) * TILE + (x - tc.0 * TILE)) as usize] = v;
         }
     }
-    out
+    any.then_some(t)
 }
 
 fn tile_rect(tc: TileCoord) -> Rect {
@@ -527,7 +588,7 @@ mod tests {
             let mut line = vec![0.0f32; n];
             line[n / 2] = 1.0;
             let mut out = Vec::new();
-            for r in box_radii(sigma) {
+            for r in box_radii(sigma, 3) {
                 box_filter(&line, r, 0.0, &mut out);
                 std::mem::swap(&mut line, &mut out);
             }
@@ -578,6 +639,59 @@ mod tests {
         // 扩展：大小一样，扩展 50% 的发光在边外更实。
         let wide = render(&tiles, None, &[effect(EffectKind::OuterGlow, 0.5, 20.0)], canvas, &PS_MODEL);
         assert!(value(&wide, 0, 52, 100) > value(&p, 0, 52, 100));
+    }
+
+    /// 同一个形状，算的范围大小不同，结果一样（只重算一片时靠这一条）。
+    #[test]
+    fn area_does_not_change_the_result() {
+        let shape_tiles = square(Rect { x0: 40, y0: 40, x1: 200, y1: 160 });
+        let m = model().0;
+        for e in [effect(EffectKind::OuterGlow, 0.1, 12.0), effect(EffectKind::OuterGlow, 0.0, 12.0), effect(EffectKind::OuterGlow, 0.1, 0.0)] {
+            let small = Rect { x0: 0, y0: 0, x1: 260, y1: 200 };
+            let big = Rect { x0: -50, y0: -70, x1: 330, y1: 260 };
+            let (p1, p2) = (effect_plane(&e, &shape(&shape_tiles, None, small), &m), effect_plane(&e, &shape(&shape_tiles, None, big), &m));
+            let worst = (40..220).flat_map(|y| (20..230).map(move |x| (x, y))).map(|(x, y)| (p1.at(x, y, 0.0) - p2.at(x, y, 0.0)).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-5, "{e:?}：{worst}");
+        }
+    }
+
+    /// 改了一部分分块之后只重算那一片：结果和整层重算一模一样。
+    #[test]
+    fn patching_after_a_stroke_matches_a_full_render() {
+        let mut tiles = square(Rect { x0: 40, y0: 40, x1: 200, y1: 160 });
+        let canvas = Rect { x0: 0, y0: 0, x1: 400, y1: 300 };
+        let fx = [
+            effect(EffectKind::OuterGlow, 0.1, 12.0),
+            effect(EffectKind::InnerGlow { center: false }, 0.2, 30.0),
+            effect(EffectKind::DropShadow { dx: 5.5, dy: 9.0, knockout: true }, 0.0, 8.0),
+        ];
+        let cache = Cache::default();
+        let before = cache.get(&tiles, None, &fx, canvas);
+        // "画一笔"：右下角添一小块，再擦掉左上角一块。
+        for y in 150..190 {
+            for x in 190..230 {
+                let t = tiles.get_mut((x / TILE, y / TILE));
+                let k = ((y % TILE) * TILE + x % TILE) as usize * 4;
+                t.0[k..k + 4].copy_from_slice(&[ONE as u16; 4]);
+            }
+        }
+        tiles.replace((0, 0), None);
+        let patched = cache.get(&tiles, None, &fx, canvas);
+        assert!(!Arc::ptr_eq(&before, &patched));
+        let full = render(&tiles, None, &fx, canvas, &model().0);
+        for (i, (a, b)) in patched.fx.iter().zip(&full.fx).enumerate() {
+            let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+            for tc in keys {
+                let (x, y) = (a.get(tc).map(|t| t.as_slice()), b.get(tc).map(|t| t.as_slice()));
+                if x != y {
+                    let zero = vec![0u16; N];
+                    let (x, y) = (x.unwrap_or(&zero), y.unwrap_or(&zero));
+                    let k = (0..N).find(|&k| x[k] != y[k]).unwrap();
+                    let n = (0..N).filter(|&k| x[k] != y[k]).count();
+                    panic!("效果 {i} 分块 {tc:?}：{n} 个不同，第一个在 ({}, {})：分块重算 {} 整层 {}", tc.0 * TILE + k as i32 % TILE, tc.1 * TILE + k as i32 / TILE, x[k], y[k]);
+                }
+            }
+        }
     }
 
     #[test]

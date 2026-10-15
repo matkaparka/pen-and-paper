@@ -67,10 +67,15 @@ pub fn file_dialog(owner: HWND, save: bool, filter: &str, ext: &str, name: &str)
 
 /// 在屏幕坐标 `at` 处弹出一个菜单，返回选中项的编号；没选返回 None。
 /// `items` 是（编号，文字，是否打勾）。
+/// 编号为 0 的一项是分隔线。
 pub fn popup(owner: HWND, at: POINT, items: &[(u32, String, bool)]) -> Option<u32> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         for (id, text, checked) in items {
+            if *id == 0 {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                continue;
+            }
             let t = wide(text);
             let flags = if *checked { MF_STRING | MF_CHECKED } else { MF_STRING };
             let _ = AppendMenuW(menu, flags, *id as usize, PCWSTR(t.as_ptr()));

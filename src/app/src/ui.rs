@@ -39,6 +39,8 @@ pub enum SliderId {
     MinDensity,
     Hardness,
     LayerOpacity,
+    /// 图层的填充不透明度（规格 F-065）
+    LayerFill,
     /// 油漆桶和魔棒的颜色容差
     Tolerance,
     /// 油漆桶和魔棒的缝隙闭合
@@ -479,6 +481,14 @@ pub fn build(app: &App, client: (i32, i32)) -> Layout {
         kind: Kind::Slider { label: tr("不透明度", "Opacity"), value: active.opacity, text: pct(active.opacity), id: SliderId::LayerOpacity },
     });
     y += px(30.0);
+    // 填充不透明度（PS 的"填充"）：不是 100% 的图层才显示；拖到 100% 以后，换图层之前还留着。
+    if active.fill < 0.9995 || app.fill_slider == Some(a) {
+        items.push(Item {
+            rect: RECT { left: l, top: y, right: r, bottom: y + px(24.0) },
+            kind: Kind::Slider { label: tr("填充", "Fill"), value: active.fill, text: pct(active.fill), id: SliderId::LayerFill },
+        });
+        y += px(30.0);
+    }
     // 当前图层的三个开关：保护不透明度、锁定、剪贴（规格 F-053、F-054）。文件夹没有像素，不用保护不透明度。
     let pixels = current.is_pixels();
     let toggles = [
@@ -836,6 +846,7 @@ pub fn paint(app: &App, layout: &Layout, dc: HDC, bits: &mut [u32], stride: usiz
                         label += &format!("  {:.0}%", p.opacity * 100.0);
                     }
                     match layer.kind {
+                        LayerKind::Folder { .. } if layer.artboard.is_some() => label += tr("  〔画板〕", "  [artboard]"),
                         LayerKind::Folder { .. } => label += tr("  〔组〕", "  [group]"),
                         LayerKind::Fill(_) => label += tr("  〔填充〕", "  [fill]"),
                         LayerKind::Pixels => {}
@@ -983,7 +994,7 @@ mod tests {
             // 图层行里的"眼睛"和蒙版那一格。
             (&["On", "Off"], 26),
             (&["M"], 30),
-            (&["Blend: Pass Through", "Blend: Difference"], 212 - 16 - 12),
+            (&["Blend: Pass Through", "Blend: Difference", "Blend: Linear Dodge (Add)", "Blend: Lighter Color", "Blend: Luminosity"], 212 - 16 - 12),
             (&["Zoom −", "Zoom +"], 64),
             (&["Rotate L", "Rotate R"], 72),
             (&["Mirror"], 60),

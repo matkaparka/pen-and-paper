@@ -96,6 +96,10 @@ const MODIFIER_GRACE: Duration = Duration::from_millis(300);
 const LIQUIFY_TICK: Duration = Duration::from_millis(15);
 /// 上面那个计时器的编号。
 const LIQUIFY_TIMER: usize = 2;
+/// 拖着图层停在列表上下边上时，隔这么久滚一行。
+const LAYER_SCROLL_TICK: Duration = Duration::from_millis(80);
+/// 上面那个计时器的编号。
+const LAYER_SCROLL_TIMER: usize = 3;
 
 // 系统询问"这个窗口要不要笔的长按、轻拂等手势"的消息，以及回答"都不要"的标志位。
 // 这些手势会让系统推迟报告落笔，对画布没有用处。
@@ -602,8 +606,12 @@ pub struct App {
     pub layer_scroll: usize,
     /// 拖动图层时松手会放到哪里
     pub layer_drop: Option<ui::Drop>,
+    /// 拖着图层时指针最后的位置，和停在列表上边（−1）、下边（1）还是中间（0）
+    layer_drag_at: (i32, i32, i32),
     /// 上次排界面时的当前图层和图层个数
     listed_state: (usize, usize),
+    /// 拖过"填充"滑块的图层：填充回到 100% 以后，滑块在它上面还留着
+    pub fill_slider: Option<usize>,
 }
 
 thread_local! {
@@ -940,6 +948,37 @@ impl App {
             self.layer_scroll = p;
         } else if p >= self.layer_scroll + fit {
             self.layer_scroll = p + 1 - fit;
+        }
+    }
+
+    /// 拖着图层时，按指针最后的位置重新算松手会放到哪里（拖出图层那一列再松手就是不挪）。
+    fn update_layer_drop(&mut self) {
+        let (x, y, _) = self.layer_drag_at;
+        let l = &self.layout.layers;
+        let inside = x >= l.left && x < l.right;
+        let drop = if inside { ui::drop_at(&self.doc, &self.layout, y, self.scale) } else { None };
+        if drop != self.layer_drop {
+            self.layer_drop = drop;
+            self.refresh_ui();
+        }
+    }
+
+    /// 拖着图层停在列表上下边上：滚一行。离开边上或者松了手就停。
+    fn layer_scroll_tick(&mut self) {
+        let dir = self.layer_drag_at.2;
+        if dir == 0 || !matches!(self.grab, Some(Grab::Layer { moving: true, .. })) {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), LAYER_SCROLL_TIMER);
+            }
+            return;
+        }
+        let before = self.layer_scroll;
+        self.layer_scroll = (self.layer_scroll as isize + dir as isize).max(0) as usize;
+        self.refresh_ui();
+        self.layer_scroll = self.layout.layer_first;
+        if self.layer_scroll != before {
+            self.layer_drop = None;
+            self.update_layer_drop();
         }
     }
 
@@ -1788,13 +1827,20 @@ impl App {
                 self.refresh_all();
                 return;
             }
-            SliderId::LayerOpacity => {
+            SliderId::LayerOpacity | SliderId::LayerFill => {
                 let index = self.doc.active();
                 let props = self.doc.layers()[index].props.clone();
                 if self.props_before.is_none() {
                     self.props_before = Some((index, props.clone()));
                 }
-                self.doc.set_props_live(index, LayerProps { opacity: pct, ..props });
+                let props = if id == SliderId::LayerFill {
+                    // 拖到 100% 时滑块也不马上消失。
+                    self.fill_slider = Some(index);
+                    LayerProps { fill: pct, ..props }
+                } else {
+                    LayerProps { opacity: pct, ..props }
+                };
+                self.doc.set_props_live(index, props);
                 self.document_changed();
                 return;
             }
@@ -1892,19 +1938,32 @@ impl App {
                         return None;
                     }
                     self.grab = Some(Grab::Layer { y0, moving: true });
-                    // 拖出图层那一列再松手就是不挪。
-                    let l = &self.layout.layers;
-                    let inside = x >= l.left && x < l.right;
-                    let drop = if inside { ui::drop_at(&self.doc, &self.layout, y, self.scale) } else { None };
-                    if drop != self.layer_drop {
-                        self.layer_drop = drop;
-                        self.refresh_ui();
+                    // 停在列表的上边、下边（第一行、最后一行再往外一点）就自己滚。
+                    let rows: Vec<RECT> = self.layout.items.iter().filter(|i| matches!(i.kind, Kind::LayerRow { .. })).map(|i| i.rect).collect();
+                    let edge = (20.0 * self.scale) as i32;
+                    let dir = match (rows.first(), rows.last()) {
+                        (Some(first), _) if y < first.top + edge => -1,
+                        (_, Some(last)) if y > last.bottom - edge => 1,
+                        _ => 0,
+                    };
+                    if dir != 0 && self.layer_drag_at.2 == 0 {
+                        unsafe {
+                            SetTimer(Some(self.hwnd), LAYER_SCROLL_TIMER, LAYER_SCROLL_TICK.as_millis() as u32, None);
+                        }
                     }
+                    self.layer_drag_at = (x, y, dir);
+                    self.update_layer_drop();
                 }
                 _ => {}
             },
             WM_LBUTTONUP => {
                 let grab = self.grab.take();
+                if matches!(grab, Some(Grab::Layer { .. })) {
+                    self.layer_drag_at.2 = 0;
+                    unsafe {
+                        let _ = KillTimer(Some(self.hwnd), LAYER_SCROLL_TIMER);
+                    }
+                }
                 if let Some(Grab::Layer { moving: true, .. }) = grab {
                     if let Some(d) = self.layer_drop.take() {
                         // 进行中的变换、液化、滤镜记着图层的序号，挪动之前先确定下来。
@@ -2341,7 +2400,9 @@ fn main() -> Result<()> {
                 rename: None,
                 layer_scroll: 0,
                 layer_drop: None,
+                layer_drag_at: (0, 0, 0),
                 listed_state: (usize::MAX, 0),
+                fill_slider: None,
             })
         });
         let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
@@ -2652,9 +2713,16 @@ fn run_later(hwnd: HWND, later: Later) {
                         ((!l.is_folder() || !l.props.pass_through).then_some(l.props.blend), l.is_folder())
                     })
                     .unwrap_or((Some(BlendMode::Normal), false));
-                    // 文件夹的第一项是"穿透"（实现方案 §3.11），编号排在混合模式后面。
+                    // 文件夹的第一项是"穿透"（实现方案 §3.11），编号排在混合模式后面。模式按 PS 的样子分组，组间有分隔线。
                     let pass = folder.then(|| (BlendMode::ALL.len() as u32 + 1, tr("穿透", "Pass Through").to_string(), cur.is_none()));
-                    pass.into_iter().chain(BlendMode::ALL.iter().enumerate().map(|(i, m)| (i as u32 + 1, m.label().to_string(), Some(*m) == cur))).collect()
+                    let mut items: Vec<(u32, String, bool)> = pass.into_iter().collect();
+                    for (i, m) in BlendMode::ALL.iter().enumerate() {
+                        if BlendMode::GROUP_STARTS.contains(m) {
+                            items.push((0, String::new(), false));
+                        }
+                        items.push((i as u32 + 1, m.label().to_string(), Some(*m) == cur));
+                    }
+                    items
                 }
             };
             let Some(choice) = dialogs::popup(hwnd, at, &items) else { return };
@@ -2873,6 +2941,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_TIMER if wp.0 == LIQUIFY_TIMER => {
                 with_app(|app| app.liquify_tick());
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == LAYER_SCROLL_TIMER => {
+                with_app(|app| app.layer_scroll_tick());
                 LRESULT(0)
             }
             WM_CLOSE => {

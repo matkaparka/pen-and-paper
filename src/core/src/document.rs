@@ -27,56 +27,135 @@ const MAX_UNDO_STEPS: usize = 300;
 const MAX_UNDO_BYTES: usize = 1 << 30;
 const MIN_UNDO_STEPS: usize = 100;
 
-/// 图层混合模式。公式取自 W3C《Compositing and Blending Level 1》。
+/// 图层混合模式。公式取自 W3C《Compositing and Blending Level 1》；W3C 没有的几种照 PS 公开的定义
+/// （实现方案 §3.17）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendMode {
     Normal,
-    Multiply,
-    Screen,
-    Overlay,
     Darken,
+    Multiply,
+    ColorBurn,
+    LinearBurn,
+    DarkerColor,
     Lighten,
+    Screen,
+    ColorDodge,
     Add,
+    LighterColor,
+    Overlay,
+    SoftLight,
+    HardLight,
+    VividLight,
+    LinearLight,
+    PinLight,
+    HardMix,
     Difference,
+    Exclusion,
+    Subtract,
+    Divide,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
 
 impl BlendMode {
-    pub const ALL: [BlendMode; 8] = [
+    /// 全部模式，按 PS 的样子分组排列（组的第一个见 `GROUP_STARTS`）。
+    pub const ALL: [BlendMode; 26] = [
         BlendMode::Normal,
-        BlendMode::Multiply,
-        BlendMode::Screen,
-        BlendMode::Overlay,
         BlendMode::Darken,
+        BlendMode::Multiply,
+        BlendMode::ColorBurn,
+        BlendMode::LinearBurn,
+        BlendMode::DarkerColor,
         BlendMode::Lighten,
+        BlendMode::Screen,
+        BlendMode::ColorDodge,
         BlendMode::Add,
+        BlendMode::LighterColor,
+        BlendMode::Overlay,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+        BlendMode::VividLight,
+        BlendMode::LinearLight,
+        BlendMode::PinLight,
+        BlendMode::HardMix,
         BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Subtract,
+        BlendMode::Divide,
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
     ];
+
+    /// 每组的第一个：下拉表在它们前面画分隔线。
+    pub const GROUP_STARTS: [BlendMode; 5] = [BlendMode::Darken, BlendMode::Lighten, BlendMode::Overlay, BlendMode::Difference, BlendMode::Hue];
 
     /// 界面上显示的名称。
     pub fn label(self) -> &'static str {
+        use BlendMode::*;
         match self {
-            BlendMode::Normal => tr("正常", "Normal"),
-            BlendMode::Multiply => tr("正片叠底", "Multiply"),
-            BlendMode::Screen => tr("滤色", "Screen"),
-            BlendMode::Overlay => tr("叠加", "Overlay"),
-            BlendMode::Darken => tr("变暗", "Darken"),
-            BlendMode::Lighten => tr("变亮", "Lighten"),
-            BlendMode::Add => tr("线性减淡", "Add"),
-            BlendMode::Difference => tr("差值", "Difference"),
+            Normal => tr("正常", "Normal"),
+            Darken => tr("变暗", "Darken"),
+            Multiply => tr("正片叠底", "Multiply"),
+            ColorBurn => tr("颜色加深", "Color Burn"),
+            LinearBurn => tr("线性加深", "Linear Burn"),
+            DarkerColor => tr("深色", "Darker Color"),
+            Lighten => tr("变亮", "Lighten"),
+            Screen => tr("滤色", "Screen"),
+            ColorDodge => tr("颜色减淡", "Color Dodge"),
+            Add => tr("线性减淡（添加）", "Linear Dodge (Add)"),
+            LighterColor => tr("浅色", "Lighter Color"),
+            Overlay => tr("叠加", "Overlay"),
+            SoftLight => tr("柔光", "Soft Light"),
+            HardLight => tr("强光", "Hard Light"),
+            VividLight => tr("亮光", "Vivid Light"),
+            LinearLight => tr("线性光", "Linear Light"),
+            PinLight => tr("点光", "Pin Light"),
+            HardMix => tr("实色混合", "Hard Mix"),
+            Difference => tr("差值", "Difference"),
+            Exclusion => tr("排除", "Exclusion"),
+            Subtract => tr("减去", "Subtract"),
+            Divide => tr("划分", "Divide"),
+            Hue => tr("色相", "Hue"),
+            Saturation => tr("饱和度", "Saturation"),
+            Color => tr("颜色", "Color"),
+            Luminosity => tr("明度", "Luminosity"),
         }
     }
 
     /// 写进文件的标识。
     pub fn id(self) -> &'static str {
+        use BlendMode::*;
         match self {
-            BlendMode::Normal => "normal",
-            BlendMode::Multiply => "multiply",
-            BlendMode::Screen => "screen",
-            BlendMode::Overlay => "overlay",
-            BlendMode::Darken => "darken",
-            BlendMode::Lighten => "lighten",
-            BlendMode::Add => "add",
-            BlendMode::Difference => "difference",
+            Normal => "normal",
+            Darken => "darken",
+            Multiply => "multiply",
+            ColorBurn => "color-burn",
+            LinearBurn => "linear-burn",
+            DarkerColor => "darker-color",
+            Lighten => "lighten",
+            Screen => "screen",
+            ColorDodge => "color-dodge",
+            Add => "add",
+            LighterColor => "lighter-color",
+            Overlay => "overlay",
+            SoftLight => "soft-light",
+            HardLight => "hard-light",
+            VividLight => "vivid-light",
+            LinearLight => "linear-light",
+            PinLight => "pin-light",
+            HardMix => "hard-mix",
+            Difference => "difference",
+            Exclusion => "exclusion",
+            Subtract => "subtract",
+            Divide => "divide",
+            Hue => "hue",
+            Saturation => "saturation",
+            Color => "color",
+            Luminosity => "luminosity",
         }
     }
 
@@ -84,26 +163,207 @@ impl BlendMode {
         Self::ALL.into_iter().find(|m| m.id() == id)
     }
 
-    /// 底色 b 和源色 s（都是 0..=ONE 的非预乘通道值）混合后的颜色。
+    /// 逐个分量算的模式（色相、饱和度、颜色、明度、深色、浅色要三个分量一起算）。
+    fn separable(self) -> bool {
+        !matches!(self, BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity | BlendMode::DarkerColor | BlendMode::LighterColor)
+    }
+
+    /// 底色 b 和源色 s（都是 0..=ONE 的非预乘通道值）混合后的颜色。只用于逐个分量算的模式。
     #[inline]
     fn mix(self, b: u32, s: u32) -> u32 {
+        use BlendMode::*;
+        let screen = |b: u32, s: u32| b + s - mul15(b, s);
+        let burn = |b: u32, s: u32| {
+            if b >= ONE {
+                ONE
+            } else {
+                // s = 0 时结果是 0。
+                ((ONE - b) * ONE).checked_div(s).map_or(0, |q| ONE - q.min(ONE))
+            }
+        };
+        let dodge = |b: u32, s: u32| {
+            if b == 0 {
+                0
+            } else if s >= ONE {
+                ONE
+            } else {
+                (b * ONE / (ONE - s)).min(ONE)
+            }
+        };
         match self {
-            BlendMode::Normal => s,
-            BlendMode::Multiply => mul15(b, s),
-            BlendMode::Screen => b + s - mul15(b, s),
-            BlendMode::Overlay => {
+            Normal => s,
+            Multiply => mul15(b, s),
+            Screen => screen(b, s),
+            Overlay => {
                 if b * 2 <= ONE {
                     mul15(2 * b, s)
                 } else {
                     ONE - mul15(2 * (ONE - b), ONE - s)
                 }
             }
-            BlendMode::Darken => b.min(s),
-            BlendMode::Lighten => b.max(s),
-            BlendMode::Add => (b + s).min(ONE),
-            BlendMode::Difference => b.abs_diff(s),
+            Darken => b.min(s),
+            Lighten => b.max(s),
+            Add => (b + s).min(ONE),
+            Difference => b.abs_diff(s),
+            ColorBurn => burn(b, s),
+            LinearBurn => (b + s).saturating_sub(ONE),
+            ColorDodge => dodge(b, s),
+            HardLight => {
+                if s * 2 <= ONE {
+                    mul15(b, 2 * s)
+                } else {
+                    screen(b, 2 * s - ONE)
+                }
+            }
+            SoftLight => {
+                let (bf, sf) = (b as f32 / ONE as f32, s as f32 / ONE as f32);
+                let v = if sf <= 0.5 {
+                    bf - (1.0 - 2.0 * sf) * bf * (1.0 - bf)
+                } else {
+                    let d = if bf <= 0.25 { ((16.0 * bf - 12.0) * bf + 4.0) * bf } else { bf.sqrt() };
+                    bf + (2.0 * sf - 1.0) * (d - bf)
+                };
+                (v.clamp(0.0, 1.0) * ONE as f32).round() as u32
+            }
+            VividLight => {
+                if s * 2 <= ONE {
+                    burn(b, 2 * s)
+                } else {
+                    dodge(b, 2 * s - ONE)
+                }
+            }
+            LinearLight => (b + 2 * s).saturating_sub(ONE).min(ONE),
+            PinLight => {
+                if s * 2 <= ONE {
+                    b.min(2 * s)
+                } else {
+                    b.max(2 * s - ONE)
+                }
+            }
+            HardMix => {
+                if b + s >= ONE {
+                    ONE
+                } else {
+                    0
+                }
+            }
+            Exclusion => b + s - 2 * mul15(b, s),
+            Subtract => b.saturating_sub(s),
+            // s = 0 时：b 也是 0 就是 0，否则是 1。
+            Divide => (b * ONE).checked_div(s).map_or(if b == 0 { 0 } else { ONE }, |q| q.min(ONE)),
+            Hue | Saturation | Color | Luminosity | DarkerColor | LighterColor => s,
         }
     }
+
+    /// 三个分量一起算的模式（W3C 的色相、饱和度、颜色、明度；PS 的深色、浅色）。b、s 是非预乘的 0..=ONE。
+    fn mix3(self, b: [u32; 3], s: [u32; 3]) -> [u32; 3] {
+        let f = |c: [u32; 3]| c.map(|v| v as f32 / ONE as f32);
+        let (bf, sf) = (f(b), f(s));
+        let out = match self {
+            BlendMode::Hue => set_lum(set_sat(sf, sat(bf)), lum(bf)),
+            BlendMode::Saturation => set_lum(set_sat(bf, sat(sf)), lum(bf)),
+            BlendMode::Color => set_lum(sf, lum(bf)),
+            BlendMode::Luminosity => set_lum(bf, lum(sf)),
+            // 深色、浅色：整个像素取三个分量加起来小（大）的那一个。
+            BlendMode::DarkerColor => return if s.iter().sum::<u32>() < b.iter().sum::<u32>() { s } else { b },
+            BlendMode::LighterColor => return if s.iter().sum::<u32>() > b.iter().sum::<u32>() { s } else { b },
+            other => return [0, 1, 2].map(|c| other.mix(b[c], s[c])),
+        };
+        out.map(|v| (v.clamp(0.0, 1.0) * ONE as f32).round() as u32)
+    }
+}
+
+/// 填充不透明度的几种可能的作用（实现方案 §3.18），校准时换着试；平时是 `FILL_PS`。
+/// 0：和不透明度一样乘在透明度上；1：PS 那八种模式里把颜色往"不起作用的颜色"拉（透明度不变），别的模式同 0；
+/// 2：同 1，另外这八种模式的图层"透明形状图层"关着时，透明度也折进颜色里（拉得更多），按整块铺满来混合。
+pub static FILL_MODEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FILL_PS);
+/// 校准后定下来的作用。
+pub const FILL_PS: u8 = 2;
+
+/// PS 里填充不透明度起作用方式不同的那几种模式，和它们"不起作用"的颜色（拿这个颜色混合，结果就是底色）。
+fn neutral(mode: BlendMode) -> Option<u32> {
+    match mode {
+        BlendMode::ColorBurn | BlendMode::LinearBurn => Some(ONE),
+        BlendMode::ColorDodge | BlendMode::Add | BlendMode::Difference => Some(0),
+        BlendMode::VividLight | BlendMode::LinearLight => Some(ONE / 2),
+        _ => None,
+    }
+}
+
+/// 填充不透明度 `fill`（0..=ONE）作用在图层的一个像素（预乘）上。
+#[inline]
+fn with_fill(px: [u16; 4], fill: u32, mode: BlendMode) -> [u16; 4] {
+    if fill >= ONE {
+        return px;
+    }
+    let a = px[3] as u32;
+    match neutral(mode).filter(|_| FILL_MODEL.load(std::sync::atomic::Ordering::Relaxed) >= 1) {
+        Some(n) if a > 0 => {
+            let pull = |c: usize| {
+                let s = (px[c] as u32 * ONE / a).min(ONE) as i64;
+                let v = n as i64 + ((s - n as i64) * fill as i64 + (ONE / 2) as i64).div_euclid(ONE as i64);
+                mul15(v.clamp(0, ONE as i64) as u32, a).min(a) as u16
+            };
+            [pull(0), pull(1), pull(2), px[3]]
+        }
+        _ => px.map(|c| mul15(c as u32, fill) as u16),
+    }
+}
+
+/// 透明形状图层关着、模式是那八种之一时（`FILL_MODEL` 为 2）：像素的透明度和填充一起把颜色往"不起作用的颜色"拉，
+/// 返回整块铺满（透明度 ONE）的像素。别的情况返回 None。
+#[inline]
+fn shapeless(px: [u16; 4], fill: u32, mode: BlendMode, shapes: bool) -> Option<[u16; 4]> {
+    let model = FILL_MODEL.load(std::sync::atomic::Ordering::Relaxed);
+    if shapes || model < 2 || (model == 3 && fill >= ONE) {
+        return None;
+    }
+    let n = neutral(mode)?;
+    let a = px[3] as u32;
+    if a == 0 {
+        return None;
+    }
+    let k = mul15(fill, a) as i64;
+    let pull = |c: usize| {
+        let s = (px[c] as u32 * ONE / a).min(ONE) as i64;
+        (n as i64 + ((s - n as i64) * k + (ONE / 2) as i64).div_euclid(ONE as i64)).clamp(0, ONE as i64) as u16
+    };
+    Some([pull(0), pull(1), pull(2), ONE as u16])
+}
+
+/// W3C 不可分离模式用的亮度。
+fn lum(c: [f32; 3]) -> f32 {
+    0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+}
+
+fn clip_color(c: [f32; 3]) -> [f32; 3] {
+    let l = lum(c);
+    let (n, x) = (c[0].min(c[1]).min(c[2]), c[0].max(c[1]).max(c[2]));
+    let mut c = c;
+    if n < 0.0 {
+        c = c.map(|v| l + (v - l) * l / (l - n));
+    }
+    if x > 1.0 {
+        c = c.map(|v| l + (v - l) * (1.0 - l) / (x - l));
+    }
+    c
+}
+
+fn set_lum(c: [f32; 3], l: f32) -> [f32; 3] {
+    let d = l - lum(c);
+    clip_color(c.map(|v| v + d))
+}
+
+fn sat(c: [f32; 3]) -> f32 {
+    c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
+}
+
+fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
+    let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+    if mx <= mn {
+        return [0.0; 3];
+    }
+    c.map(|v| (v - mn) * s / (mx - mn))
 }
 
 /// 图层上除像素以外的属性。
@@ -122,6 +382,10 @@ pub struct LayerProps {
     pub clip: bool,
     /// 穿透（只对文件夹有意义）：里面的图层直接和文件夹下面的画面混合，不先合成一张再叠上去（实现方案 §3.11）
     pub pass_through: bool,
+    /// 填充不透明度（PS 的"填充"），0 到 1（规格 F-065）
+    pub fill: f32,
+    /// 透明形状图层（PS 的同名设置，默认开），只是读进来、存回去
+    pub shapes: bool,
 }
 
 impl Default for LayerProps {
@@ -135,6 +399,8 @@ impl Default for LayerProps {
             locked: false,
             clip: false,
             pass_through: false,
+            fill: 1.0,
+            shapes: true,
         }
     }
 }
@@ -228,6 +494,17 @@ pub enum Part {
     Mask(Option<Mask>),
 }
 
+/// PS 的画板（规格 F-064，实现方案 §3.16）：一个组，里面的东西垫着背景色、只在矩形里显示。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Artboard {
+    /// 画板的矩形；读不懂时是 None，当普通组画
+    pub rect: Option<Rect>,
+    /// 背景色；None 是透明
+    pub background: Option<[u8; 3]>,
+    /// PS 原来的块（`artb`，有 `artd`、`abdd` 也一起），存回 PSD 时原样写回去
+    pub psd: Vec<([u8; 4], Vec<u8>)>,
+}
+
 #[derive(Clone)]
 pub struct Layer {
     pub props: LayerProps,
@@ -239,6 +516,8 @@ pub struct Layer {
     pub mask: Option<Mask>,
     /// 图层样式（规格 F-062）
     pub style: Option<Style>,
+    /// PS 的画板（规格 F-064），只有组会有
+    pub artboard: Option<Artboard>,
     /// 样式画好的效果，按图层缓存
     pub fx: crate::style::Cache,
 }
@@ -250,7 +529,7 @@ impl Layer {
 
     /// 像素图层。
     pub fn pixels(props: LayerProps, tiles: TileMap) -> Self {
-        Self { props, tiles, kind: Kind::Pixels, depth: 0, mask: None, style: None, fx: Default::default() }
+        Self { props, tiles, kind: Kind::Pixels, depth: 0, mask: None, style: None, artboard: None, fx: Default::default() }
     }
 
     /// 空的文件夹，新建的默认穿透。
@@ -262,6 +541,7 @@ impl Layer {
             depth: 0,
             mask: None,
             style: None,
+            artboard: None,
             fx: Default::default(),
         }
     }
@@ -961,7 +1241,11 @@ impl Document {
             // 上面紧跟着剪贴的兄弟的话，这一层各像素的不透明度要留下来给它们当遮罩。
             let feeds = !clipped && siblings.get(k + 1).is_some_and(|&j| self.layers[j].props.clip);
             // 里面的东西在这个分块上都没有内容（也没在画）的组什么也不添，整个跳过；拿它当底的剪贴图层也就什么都不显示。
+            // 画板（实现方案 §3.16）：矩形和背景色。
+            let board = layer.artboard.as_ref().and_then(|a| a.rect.map(|r| (r, a.background)));
+            let board_fill = board.is_some_and(|(r, bg)| bg.is_some() && !r.intersect(tile_rect(tc)).is_empty());
             if layer.is_folder()
+                && !board_fill
                 && !children.clone().any(|i| {
                     let l = &self.layers[i];
                     l.tiles.get(tc).is_some() || matches!(l.kind, Kind::Fill(_)) || live.touches(i)
@@ -970,9 +1254,10 @@ impl Document {
                 continue;
             }
             let opacity = (layer.props.opacity.clamp(0.0, 1.0) * ONE as f32) as u32;
+            let fill = (layer.props.fill.clamp(0.0, 1.0) * ONE as f32).round() as u32;
             let mask = self.mask_values(li, tc, live);
 
-            if layer.is_folder() && layer.props.pass_through {
+            if layer.is_folder() && layer.props.pass_through && board.is_none() {
                 // 穿透：里面的东西直接叠在一份拷贝上，再按不透明度（乘蒙版、剪贴）在原来和拷贝之间过渡。
                 let mut copy = acc.to_vec();
                 self.level(tc, &mut copy, children.clone(), pick, live);
@@ -1001,7 +1286,28 @@ impl Document {
                 Kind::Fill(fill) => Some(fill_pixels(fill)),
                 Kind::Folder { .. } => {
                     let mut sub = vec![[0u32; 4]; N];
+                    let whole = tile_rect(tc);
+                    let inside = |i: usize, r: Rect| {
+                        let (x, y) = (whole.x0 + (i as i32 % TILE), whole.y0 + (i as i32 / TILE));
+                        x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1
+                    };
+                    // 画板：矩形里先铺背景色，里面的东西叠在上面；叠完把矩形外的去掉。
+                    if let Some((r, Some(c))) = board {
+                        let px = [to15(c[0]), to15(c[1]), to15(c[2]), ONE];
+                        for (i, p) in sub.iter_mut().enumerate() {
+                            if inside(i, r) {
+                                *p = px;
+                            }
+                        }
+                    }
                     self.level(tc, &mut sub, children, pick, live);
+                    if let Some((r, _)) = board {
+                        for (i, p) in sub.iter_mut().enumerate() {
+                            if !inside(i, r) {
+                                *p = [0; 4];
+                            }
+                        }
+                    }
                     Some(sub.iter().map(|p| p.map(|v| v.min(ONE) as u16)).collect())
                 }
             };
@@ -1045,6 +1351,7 @@ impl Document {
                     if feeds {
                         base_alpha[i] = px[3];
                     }
+                    px = with_fill(px, fill, layer.props.blend);
                     if px[3] != 0 {
                         out = blend(out, px, ONE, layer.props.blend);
                     }
@@ -1070,8 +1377,9 @@ impl Document {
             if feeds {
                 base_alpha.resize(N, 0);
             }
-            // 最常见的情况（普通图层，没有蒙版、剪贴，也不在画它）单走一条不带分支的路。
-            if let (None, Some(t), false, None, false, false) = (&own, tile, painting, &mask, feeds, clipped) {
+            // 最常见的情况（普通图层，没有蒙版、剪贴、填充，也不在画它）单走一条不带分支的路。
+            let plain = fill >= ONE && (layer.props.shapes || neutral(layer.props.blend).is_none());
+            if let (None, Some(t), false, None, false, false, true) = (&own, tile, painting, &mask, feeds, clipped, plain) {
                 for (dst, p) in acc.iter_mut().zip(t.0.as_chunks::<4>().0) {
                     if p[3] != 0 {
                         *dst = blend(*dst, *p, opacity, layer.props.blend);
@@ -1095,9 +1403,24 @@ impl Document {
                     let v = m[i] as u32;
                     px = px.map(|c| mul15(c as u32, v) as u16);
                 }
+                // 剪贴在它上面的图层，底是填充以前的透明度。
                 if feeds {
                     base_alpha[i] = px[3];
                 }
+                // 透明形状图层关着：底下不透明时，按整块铺满来混合（剪贴的铺满剪贴的底）。
+                if dst[3] >= ONE {
+                    if let Some(mut full) = shapeless(px, fill, layer.props.blend, layer.props.shapes) {
+                        if clipped {
+                            let a = base_alpha[i] as u32;
+                            full = full.map(|v| mul15(v as u32, a) as u16);
+                        }
+                        if full[3] != 0 {
+                            *dst = blend(*dst, full, opacity, layer.props.blend);
+                        }
+                        continue;
+                    }
+                }
+                px = with_fill(px, fill, layer.props.blend);
                 if clipped {
                     let a = base_alpha[i] as u32;
                     px = px.map(|v| mul15(v as u32, a) as u16);
@@ -1309,16 +1632,25 @@ fn blend(dst: [u32; 4], src: [u16; 4], opacity: u32, mode: BlendMode) -> [u32; 4
     let mut out = [0u32; 4];
     out[3] = (sa + mul15(da, ONE - sa)).min(ONE);
     let alpha = out[3];
+    // 混合公式要用非预乘的颜色。
+    let mixed = if mode == BlendMode::Normal || da == 0 {
+        [0; 3]
+    } else {
+        let s = [0, 1, 2].map(|c| (src[c] as u32 * ONE / src[3] as u32).min(ONE));
+        let b = [0, 1, 2].map(|c| (dst[c] * ONE / da).min(ONE));
+        if mode.separable() {
+            [0, 1, 2].map(|c| mode.mix(b[c], s[c]))
+        } else {
+            mode.mix3(b, s)
+        }
+    };
     for (c, o) in out.iter_mut().take(3).enumerate() {
         let sc = mul15(src[c] as u32, opacity); // 预乘后的源色
         let v = if mode == BlendMode::Normal || da == 0 {
             sc + mul15(dst[c], ONE - sa)
         } else {
-            // 混合公式要用非预乘的颜色。
-            let s = (src[c] as u32 * ONE / src[3] as u32).min(ONE);
-            let b = (dst[c] * ONE / da).min(ONE);
             let both = mul15(sa, da);
-            mul15(sc, ONE - da) + mul15(both, mode.mix(b, s)) + mul15(dst[c], ONE - sa)
+            mul15(sc, ONE - da) + mul15(both, mixed[c]) + mul15(dst[c], ONE - sa)
         };
         // 预乘像素的颜色不能超过它的透明度。几项各自四舍五入后加起来可能多出 1，这里压回去；
         // 否则这种像素存不进"非预乘"的文件格式，存盘再读回会差一点。
@@ -1555,6 +1887,83 @@ mod tests {
         assert_eq!((doc.layers().len(), doc.active()), (2, 1));
         assert_eq!(doc.pick(50, 30).unwrap(), a);
         assert!(!doc.merge_down() || doc.active() == 0);
+    }
+
+    /// 补上的混合模式：几个好算的点（实现方案 §3.17 的公式）。
+    #[test]
+    fn added_blend_modes_follow_their_formulas() {
+        let q = |v: f32| (v * ONE as f32).round() as u32;
+        let near = |a: u32, b: f32| (a as i64 - q(b) as i64).abs() <= 2;
+        use BlendMode::*;
+        let cases: [(BlendMode, f32, f32, f32); 16] = [
+            (ColorDodge, 0.25, 0.5, 0.5),
+            (ColorDodge, 0.6, 0.5, 1.0),
+            (ColorBurn, 0.75, 0.5, 0.5),
+            (ColorBurn, 0.2, 0.5, 0.0),
+            (LinearBurn, 0.6, 0.7, 0.3),
+            (LinearBurn, 0.2, 0.3, 0.0),
+            (HardLight, 0.5, 0.25, 0.25),
+            (HardLight, 0.5, 0.75, 0.75),
+            (VividLight, 0.6, 0.75, 1.0),
+            (LinearLight, 0.4, 0.6, 0.6),
+            (PinLight, 0.3, 0.25, 0.3),
+            (PinLight, 0.3, 0.9, 0.8),
+            (HardMix, 0.6, 0.5, 1.0),
+            (Exclusion, 0.5, 0.5, 0.5),
+            (Subtract, 0.7, 0.2, 0.5),
+            (Divide, 0.3, 0.6, 0.5),
+        ];
+        for (mode, b, s, want) in cases {
+            let got = mode.mix(q(b), q(s));
+            assert!(near(got, want), "{mode:?}({b}, {s}) = {got}, 应为 {}", q(want));
+        }
+        // 柔光：中灰不改变底色。
+        assert!(near(SoftLight.mix(q(0.3), q(0.5)), 0.3));
+        // 颜色：灰色的源让底色变成同样亮度的灰；明度：保留底色的色相、换成源的亮度。
+        let red = [q(0.8), q(0.2), q(0.2)];
+        let grey = [q(0.5); 3];
+        let c = Color.mix3(red, grey);
+        assert!(c[0] == c[1] && c[1] == c[2] && near(c[0], 0.3 * 0.8 + 0.59 * 0.2 + 0.11 * 0.2), "{c:?}");
+        let l = Luminosity.mix3(red, grey);
+        assert!(l[0] > l[1] && l[1] == l[2] && near(((l[0] as f32 * 0.3 + l[1] as f32 * 0.59 + l[2] as f32 * 0.11) / ONE as f32 * ONE as f32) as u32, 0.5), "{l:?}");
+        // 饱和度：灰色的源去掉底色的饱和度；色相：换成源的色相，保留底色的亮度和饱和度。
+        let s0 = Saturation.mix3(red, grey);
+        assert!(s0[0] == s0[1] && s0[1] == s0[2]);
+        let h = Hue.mix3(red, [q(0.2), q(0.8), q(0.2)]);
+        assert!(h[1] > h[0] && h[1] > h[2], "{h:?}");
+        // 深色、浅色：整个像素取一个。
+        assert_eq!(DarkerColor.mix3(red, grey), red);
+        assert_eq!(LighterColor.mix3(red, grey), grey);
+        // 文件里的标识都不重复，读得回来。
+        for m in BlendMode::ALL {
+            assert_eq!(BlendMode::from_id(m.id()), Some(m));
+        }
+    }
+
+    /// 填充不透明度（实现方案 §3.18）：普通的模式乘在透明度上；PS 那八种模式把颜色往"不起作用的颜色"拉；
+    /// 透明形状图层关着时，透明度也折进颜色里，整块铺满。
+    #[test]
+    fn fill_opacity_works_like_photoshop() {
+        let half = ONE / 2;
+        let px = [16384u16, 8192, 0, 16384]; // 半透明：直色 (1, 0.5, 0)
+        assert_eq!(with_fill(px, half, BlendMode::Normal), [8192, 4096, 0, 8192]);
+        // 颜色减淡：颜色减半（往黑拉），透明度不变。
+        assert_eq!(with_fill(px, half, BlendMode::ColorDodge), [8192, 4096, 0, 16384]);
+        // 线性加深：往白拉。
+        let burn = with_fill([0, 0, 0, 16384], half, BlendMode::LinearBurn);
+        assert_eq!(burn, [8192, 8192, 8192, 16384]);
+        // 透明形状图层关着：透明度 0.5、填充 0.5，颜色拉到 1/4，铺满。
+        assert_eq!(shapeless(px, half, BlendMode::ColorDodge, false), Some([8192, 4096, 0, ONE as u16]));
+        assert_eq!(shapeless(px, half, BlendMode::ColorDodge, true), None);
+        assert_eq!(shapeless(px, half, BlendMode::Multiply, false), None);
+        // 拿"不起作用的颜色"混合，结果就是底色。
+        for mode in BlendMode::ALL {
+            if let Some(n) = neutral(mode) {
+                for b in [0u32, 7000, ONE / 2, 30000, ONE] {
+                    assert!(mode.mix(b, n).abs_diff(b) <= 1, "{mode:?} 底色 {b}");
+                }
+            }
+        }
     }
 
     /// 混合的结果必须仍是合法的预乘像素：颜色不超过透明度，透明度不超过 1。

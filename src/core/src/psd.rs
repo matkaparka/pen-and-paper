@@ -21,7 +21,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::document::{BlendMode, Document, Fill, Kind, Layer, LayerProps, Mask, Paint, MAX_SIDE};
+use crate::document::{Artboard, BlendMode, Document, Fill, Kind, Layer, LayerProps, Mask, Paint, MAX_SIDE};
 use crate::style::{Effect, EffectKind, Style};
 use crate::lang::tr;
 use crate::ora::shared::{
@@ -80,15 +80,33 @@ const MASK_DISABLED: u8 = 1 << 1;
 const MASK_HAS_PARAMS: u8 = 1 << 4;
 
 /// 混合模式在文件里的四字符代号。
-const BLEND_KEYS: [(BlendMode, &[u8; 4]); 8] = [
+const BLEND_KEYS: [(BlendMode, &[u8; 4]); 26] = [
     (BlendMode::Normal, b"norm"),
-    (BlendMode::Multiply, b"mul "),
-    (BlendMode::Screen, b"scrn"),
-    (BlendMode::Overlay, b"over"),
     (BlendMode::Darken, b"dark"),
+    (BlendMode::Multiply, b"mul "),
+    (BlendMode::ColorBurn, b"idiv"),
+    (BlendMode::LinearBurn, b"lbrn"),
+    (BlendMode::DarkerColor, b"dkCl"),
     (BlendMode::Lighten, b"lite"),
+    (BlendMode::Screen, b"scrn"),
+    (BlendMode::ColorDodge, b"div "),
     (BlendMode::Add, b"lddg"),
+    (BlendMode::LighterColor, b"lgCl"),
+    (BlendMode::Overlay, b"over"),
+    (BlendMode::SoftLight, b"sLit"),
+    (BlendMode::HardLight, b"hLit"),
+    (BlendMode::VividLight, b"vLit"),
+    (BlendMode::LinearLight, b"lLit"),
+    (BlendMode::PinLight, b"pLit"),
+    (BlendMode::HardMix, b"hMix"),
     (BlendMode::Difference, b"diff"),
+    (BlendMode::Exclusion, b"smud"),
+    (BlendMode::Subtract, b"fsub"),
+    (BlendMode::Divide, b"fdiv"),
+    (BlendMode::Hue, b"hue "),
+    (BlendMode::Saturation, b"sat "),
+    (BlendMode::Color, b"colr"),
+    (BlendMode::Luminosity, b"lum "),
 ];
 
 fn blend_key(mode: BlendMode) -> &'static [u8; 4] {
@@ -409,9 +427,19 @@ fn plan_records(doc: &Document, canvas: Rect) -> Vec<RecordOut<'_>> {
                 }
             }
         }
-        // 图层样式：PS 原来的块原样写回去（总开关改过的已经改在里面了）。
+        // 填充不透明度、透明形状图层：不是默认值的才写。
+        if p.fill < 1.0 {
+            record.blocks.push((*b"iOpa", vec![(p.fill.clamp(0.0, 1.0) * 255.0).round() as u8, 0, 0, 0]));
+        }
+        if !p.shapes {
+            record.blocks.push((*b"tsly", vec![0, 0, 0, 0]));
+        }
+        // 图层样式：PS 原来的块原样写回去（总开关改过的已经改在里面了）。画板的块也一样。
         if let Some(style) = &layer.style {
             record.blocks.extend(style.psd.iter().cloned());
+        }
+        if let Some(board) = &layer.artboard {
+            record.blocks.extend(board.psd.iter().cloned());
         }
         record.flags = flags;
         out.push(record);
@@ -883,6 +911,7 @@ fn parse(data: &[u8]) -> io::Result<(Document, Vec<String>)> {
             };
             folder.mask = mask;
             folder.style = style;
+            folder.artboard = (!record.artboard.is_empty()).then(|| parse_artboard(&record.artboard));
             layers.push(folder);
             continue;
         }
@@ -935,6 +964,8 @@ fn parse(data: &[u8]) -> io::Result<(Document, Vec<String>)> {
             blend: layer_blend(&record.blend, name, &mut notes),
             lock_alpha: record.keep_alpha,
             clip: record.clipping,
+            fill: record.fill_opacity as f32 / 255.0,
+            shapes: record.shapes,
             ..Default::default()
         };
         let mut layer = Layer::pixels(props, TileMap::default());
@@ -1055,6 +1086,10 @@ struct Record<'a> {
     channels: Vec<Channel<'a>>,
     blend: [u8; 4],
     opacity: u8,
+    /// 填充不透明度（`iOpa`），没有就是 255
+    fill_opacity: u8,
+    /// 透明形状图层（`tsly`），没有就是开
+    shapes: bool,
     clipping: bool,
     hidden: bool,
     keep_alpha: bool,
@@ -1074,6 +1109,8 @@ struct Record<'a> {
     /// 有图层样式
     /// 图层样式的块（`lfx2`、旧版的 `lrFX`、`lmfx`）
     effects: Vec<([u8; 4], &'a [u8])>,
+    /// 画板的块（`artb`、`artd`、`abdd`）
+    artboard: Vec<([u8; 4], &'a [u8])>,
     /// 文字图层
     text: bool,
     /// 智能对象
@@ -1210,6 +1247,9 @@ fn read_record<'a>(r: &mut Bytes<'a>, index: usize) -> io::Result<Record<'a>> {
         vector_mask: false,
         mask_params,
         effects: Vec::new(),
+        artboard: Vec::new(),
+        fill_opacity: 255,
+        shapes: true,
         text: false,
         smart: false,
         adjustment: false,
@@ -1230,7 +1270,10 @@ fn read_record<'a>(r: &mut Bytes<'a>, index: usize) -> io::Result<Record<'a>> {
                 }
             }
             b"vmsk" | b"vsms" => record.vector_mask = true,
+            b"iOpa" => record.fill_opacity = data.first().copied().unwrap_or(255),
+            b"tsly" => record.shapes = data.first().is_none_or(|&v| v != 0),
             b"lrFX" | b"lfx2" | b"lmfx" => record.effects.push((key, data)),
+            b"artb" | b"artd" | b"abdd" => record.artboard.push((key, data)),
             b"TySh" | b"tySh" => record.text = true,
             b"SoLd" | b"SoLE" | b"PlLd" | b"plLd" => record.smart = true,
             b"SoCo" | b"GdFl" | b"PtFl" => record.fill = Some((key, data)),
@@ -1418,6 +1461,31 @@ fn read_desc_value(r: &mut Bytes, kind: &[u8; 4], level: usize) -> Option<Desc> 
     })
 }
 
+/// 画板的块（实现方案 §3.16）：`artb` 里的描述符有矩形 `artboardRect` 和背景的种类
+/// `artboardBackgroundType`（1 白、2 黑、3 透明、4 自定，颜色在 `Clr `）。读不懂的原样留着，当普通组画。
+pub(crate) fn parse_artboard(blocks: &[([u8; 4], &[u8])]) -> Artboard {
+    let psd: Vec<([u8; 4], Vec<u8>)> = blocks.iter().map(|(k, d)| (*k, d.to_vec())).collect();
+    let parsed = blocks.iter().find(|(k, _)| k == b"artb").and_then(|(_, data)| {
+        let mut r = Bytes(data);
+        if r.u32().ok()? != 16 {
+            return None;
+        }
+        let d = read_descriptor(&mut r, 0)?;
+        let rect = d.get(b"artboardRect")?;
+        let (top, left, bottom, right) = (rect.num(b"Top ")?, rect.num(b"Left")?, rect.num(b"Btom")?, rect.num(b"Rght")?);
+        let limit = |v: f64| v.round().clamp(-(MAX_SIDE as f64) * 2.0, MAX_SIDE as f64 * 3.0) as i32;
+        let rect = Rect { x0: limit(left), y0: limit(top), x1: limit(right), y1: limit(bottom) };
+        let background = match d.num(b"artboardBackgroundType").map(|v| v as i32) {
+            Some(2) => Some([0, 0, 0]),
+            Some(3) => None,
+            Some(4) => d.get(b"Clr ").and_then(desc_color),
+            _ => Some([255, 255, 255]),
+        };
+        Some((rect, background))
+    });
+    Artboard { rect: parsed.map(|p| p.0), background: parsed.and_then(|p| p.1), psd }
+}
+
 /// 读图层样式时遇到的、要在说明里交代的事。
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum StyleIssue {
@@ -1505,13 +1573,31 @@ pub(crate) fn parse_style(blocks: &[([u8; 4], &[u8])], light: Option<(i32, i32)>
             };
             let blend = match fx.word(b"Md  ").unwrap_or(b"Nrml") {
                 b"Nrml" => Some(BlendMode::Normal),
-                b"Mltp" => Some(BlendMode::Multiply),
-                b"Scrn" => Some(BlendMode::Screen),
-                b"Ovrl" => Some(BlendMode::Overlay),
                 b"Drkn" => Some(BlendMode::Darken),
+                b"Mltp" => Some(BlendMode::Multiply),
+                b"CBrn" => Some(BlendMode::ColorBurn),
+                b"linearBurn" => Some(BlendMode::LinearBurn),
+                b"darkerColor" => Some(BlendMode::DarkerColor),
                 b"Lghn" => Some(BlendMode::Lighten),
-                b"Dfrn" => Some(BlendMode::Difference),
+                b"Scrn" => Some(BlendMode::Screen),
+                b"CDdg" => Some(BlendMode::ColorDodge),
                 b"linearDodge" => Some(BlendMode::Add),
+                b"lighterColor" => Some(BlendMode::LighterColor),
+                b"Ovrl" => Some(BlendMode::Overlay),
+                b"SftL" => Some(BlendMode::SoftLight),
+                b"HrdL" => Some(BlendMode::HardLight),
+                b"vividLight" => Some(BlendMode::VividLight),
+                b"linearLight" => Some(BlendMode::LinearLight),
+                b"pinLight" => Some(BlendMode::PinLight),
+                b"hardMix" => Some(BlendMode::HardMix),
+                b"Dfrn" => Some(BlendMode::Difference),
+                b"Xclu" => Some(BlendMode::Exclusion),
+                b"blendSubtraction" => Some(BlendMode::Subtract),
+                b"blendDivide" => Some(BlendMode::Divide),
+                b"H   " => Some(BlendMode::Hue),
+                b"Strt" => Some(BlendMode::Saturation),
+                b"Clr " => Some(BlendMode::Color),
+                b"Lmns" => Some(BlendMode::Luminosity),
                 _ => None,
             };
             // 等高线不是从 (0, 0) 到 (255, 255) 的直线、带杂色、用"精确"手法的，都只能近似。
@@ -1859,6 +1945,7 @@ fn read_planes(planes: &mut [Plane], rect: Rect, sample_bytes: usize, area: Rect
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::ora::shared::testing::*;
     use crate::ora::shared::to_premultiplied;
     use crate::ONE;
@@ -2328,7 +2415,7 @@ pub(crate) mod tests {
             // 文字图层：像素留着；混合模式是本程序没有的"颜色加深"；剪贴到下面的图层。
             Fix::solid("Text", [10, 90, 12, 110], [0, 0, 255, 128])
                 .with(|l| {
-                    l.blend = *b"idiv";
+                    l.blend = *b"diss";
                     l.clipping = 1;
                     l.flags = 8 | 2;
                 })
@@ -2404,7 +2491,7 @@ pub(crate) mod tests {
         expect_note(&notes, "图层样式读不懂，不显示；存回 PSD 时原样保留：“带蒙版 𝄞”");
         assert!(layer(1).style.as_ref().is_some_and(|s| s.psd.iter().any(|(k, _)| k == b"lfx2") && s.effects.is_empty()));
         expect_note(&notes, "文字图层只读入了像素，文字不能再编辑：“Text”");
-        expect_note(&notes, "已改为“正常”：“Text（idiv）”");
+        expect_note(&notes, "已改为“正常”：“Text（diss）”");
         expect_note(&notes, "调整图层本程序没有对应的功能，已跳过：“Curves 1”");
         expect_note(&notes, "显示成透明；存回 PSD 时原样保留：“Color Fill 1”");
         expect_note(&notes, "显示的是文件里存着的像素；存回 PSD 时原样保留：“Gradient Fill 1”");
@@ -2599,7 +2686,7 @@ pub(crate) mod tests {
         let layers = [
             Fix::solid("", [0, 0, 2, 2], [1, 2, 3, 255]),
             Fix::solid("a", [-1, 0, 2, 2], [1, 2, 3, 255]).with(|l| l.channels.push((-2, raw(&[255; 6])))),
-            Fix::solid("b", [0, 0, 2, 9], [1, 2, 3, 255]).with(|l| l.blend = *b"idiv"),
+            Fix::solid("b", [0, 0, 2, 9], [1, 2, 3, 255]).with(|l| l.blend = *b"diss"),
             Fix::empty("Curves 1").block(b"curv", vec![0; 4]),
             Fix::empty("组").block(b"lsct", lsct(1)),
         ];
@@ -2612,7 +2699,7 @@ pub(crate) mod tests {
             notes,
             [
                 r#"Cropped the parts of these layers that reach more than a canvas width or height beyond the canvas: "b""#,
-                r#"Layers whose blend mode this program does not have were set to Normal: "b (idiv)""#,
+                r#"Layers whose blend mode this program does not have were set to Normal: "b (diss)""#,
                 r#"Skipped adjustment layers, which this program does not support: "Curves 1""#,
             ]
         );
@@ -2796,9 +2883,12 @@ pub(crate) mod tests {
         expect_invalid(patched(2 + 18 + 24 + 24, &[250]), "不完整");
 
         // 不认识的混合模式、ZIP 压缩：不算错，有说明。
-        let (doc, notes) = with(|l| l.blend = *b"hue ").unwrap();
+        let (doc, notes) = with(|l| l.blend = *b"diss").unwrap();
         assert_eq!(doc.layers()[0].props.blend, BlendMode::Normal);
-        expect_note(&notes, "已改为“正常”：“图层（hue）”");
+        expect_note(&notes, "已改为“正常”：“图层（diss）”");
+        // 原来没有、0.3.1 补上的模式照样读进来。
+        let (doc, notes) = with(|l| l.blend = *b"hue ").unwrap();
+        assert_eq!((doc.layers()[0].props.blend, notes.len()), (BlendMode::Hue, 0));
         let two = [base.clone(), base.clone().with(|l| l.channels[0].1[1] = 2).with(|l| l.name = b"zip".to_vec())];
         let (doc, notes) = File::new(10, 8, &two, [0; 3]).parse().unwrap();
         assert_eq!((doc.layers().len(), doc.layers()[0].props.name.as_str()), (1, "图层"));
@@ -3103,6 +3193,9 @@ pub(crate) mod tests {
     #[ignore]
     fn compare_with_merged() {
         let Some(path) = std::env::var_os("ZHIBI_PSD_COMPARE") else { return };
+        if let Some(m) = std::env::var("ZHIBI_FILL_MODEL").ok().and_then(|v| v.parse().ok()) {
+            crate::document::FILL_MODEL.store(m, std::sync::atomic::Ordering::Relaxed);
+        }
         let data = std::fs::read(&path).unwrap();
         let (doc, notes) = parse(&data).unwrap();
         println!("说明：{notes:#?}");
@@ -3192,9 +3285,14 @@ pub(crate) mod tests {
             Ok("all") => vec![RangeRule::Ignore, RangeRule::Scale, RangeRule::Shift],
             _ => vec![RangeRule::Scale],
         };
+        let passes: Vec<usize> = std::env::var("ZHIBI_PASSES").unwrap_or_else(|_| "3".into()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
         for sigma in sweep.split(',').filter_map(|v| v.trim().parse::<f32>().ok()) {
             for &range in &rules {
-                variants.push(Some(Model { sigma_per_size: sigma, range }));
+                for &passes in &passes {
+                    for inner in std::env::var("ZHIBI_INNER").unwrap_or_else(|_| sigma.to_string()).split(',').filter_map(|v| v.trim().parse::<f32>().ok()) {
+                        variants.push(Some(Model { sigma_per_size: sigma, passes, sigma_inner: inner, range }));
+                    }
+                }
             }
         }
         // 投影那一片（下半）和发光那一片（上半）分开量。
@@ -3260,6 +3358,7 @@ pub(crate) mod tests {
         /// 带单位的数（`#Prc`、`#Pxl`、`#Ang`）
         Unit(&'static [u8; 4], f64),
         Doub(f64),
+        Long(i32),
         Enum(&'static [u8], &'static [u8]),
         Obj(&'static [u8], Vec<(&'static [u8], V)>),
         List(Vec<V>),
@@ -3285,6 +3384,10 @@ pub(crate) mod tests {
             V::Doub(x) => {
                 out.extend(b"doub");
                 out.extend(x.to_bits().to_be_bytes());
+            }
+            V::Long(x) => {
+                out.extend(b"long");
+                out.extend(x.to_be_bytes());
             }
             V::Enum(t, val) => {
                 out.extend(b"enum");
@@ -3474,6 +3577,80 @@ pub(crate) mod tests {
         assert_eq!(back.pick(28, 50), Some(near));
     }
 
+    /// 找出和 PS 合并图像差 10 以上、又不在带样式图层附近的像素：列出范围、几个样本和那里有哪些图层。
+    #[test]
+    #[ignore]
+    fn locate_remaining_differences() {
+        let Some(path) = std::env::var_os("ZHIBI_PSD_COMPARE") else { return };
+        let data = std::fs::read(&path).unwrap();
+        let (doc, _) = parse(&data).unwrap();
+        let mut r = Bytes(&data);
+        r.take(12).unwrap();
+        let channels = r.u16().unwrap() as usize;
+        r.take(12).unwrap();
+        for _ in 0..3 {
+            let n = r.u32().unwrap() as usize;
+            r.take(n).unwrap();
+        }
+        let merged = read_merged(r, channels, 1, doc.bounds(), &mut Notes::default()).unwrap();
+        let ours = doc.flatten_rgb();
+        let w = doc.width as usize;
+        let mut bad: Vec<(i32, i32, [u8; 3], [u8; 4])> = Vec::new();
+        for y in 0..doc.height {
+            for x in 0..doc.width {
+                let tc = (x / TILE, y / TILE);
+                let k = ((y % TILE) * TILE + x % TILE) as usize * 4;
+                let p = merged.get(tc).map_or([0u16; 4], |t| [t.0[k], t.0[k + 1], t.0[k + 2], t.0[k + 3]]);
+                let theirs = crate::ora::shared::to_straight8(p);
+                let o = (y as usize * w + x as usize) * 3;
+                let mine = [ours[o], ours[o + 1], ours[o + 2]];
+                if (0..3).any(|c| mine[c].abs_diff(theirs[c]) > 10) {
+                    bad.push((x, y, mine, theirs));
+                }
+            }
+        }
+        // 按 128 像素的格子数一数，挑最多的几格。
+        let mut cells: HashMap<(i32, i32), usize> = HashMap::new();
+        for b in &bad {
+            *cells.entry((b.0 / 128, b.1 / 128)).or_default() += 1;
+        }
+        let mut list: Vec<_> = cells.into_iter().collect();
+        list.sort_by_key(|b| std::cmp::Reverse(b.1));
+        println!("差 10 以上的像素 {} 个；最多的格子：", bad.len());
+        for ((cx, cy), n) in list.iter().take(12) {
+            let area = Rect { x0: cx * 128, y0: cy * 128, x1: cx * 128 + 128, y1: cy * 128 + 128 };
+            let sample = bad.iter().find(|b| area.x0 <= b.0 && b.0 < area.x1 && area.y0 <= b.1 && b.1 < area.y1).unwrap();
+            let here: Vec<String> = doc
+                .layers()
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.is_folder() || content_bounds(&l.tiles, area) != Rect::EMPTY)
+                .map(|(i, l)| format!("#{i}{}{}{}{}{}", if l.props.visible { "" } else { "(隐)" }, if l.props.clip { "(剪)" } else { "" }, if l.is_folder() { "(组)" } else { "" }, if l.style.is_some() { "(样)" } else { "" }, l.depth))
+                .collect();
+            println!("  格 ({}, {}) {n} 个，例如 ({}, {}) 我们 {:?} PS {:?}；这里的图层：{}", cx * 128, cy * 128, sample.0, sample.1, sample.2, sample.3, here.join(" "));
+        }
+    }
+
+    /// 几个点上每个图层的像素（`ZHIBI_PSD_COMPARE` 指着那个 PSD，`ZHIBI_POINTS` 是 "x,y;x,y"）。
+    #[test]
+    #[ignore]
+    fn layers_at_points() {
+        let Some(path) = std::env::var_os("ZHIBI_PSD_COMPARE") else { return };
+        let points = std::env::var("ZHIBI_POINTS").unwrap_or_default();
+        let (doc, _) = load(std::path::Path::new(&path)).unwrap();
+        for pt in points.split(';') {
+            let v: Vec<i32> = pt.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            let (x, y) = (v[0], v[1]);
+            println!("({x}, {y}) 合成 {:?}", doc.pick(x, y));
+            for (i, l) in doc.layers().iter().enumerate() {
+                let p = pixel(l, x, y);
+                if p[3] != 0 || l.is_folder() {
+                    println!("  #{i} 深 {} {:?} 显 {} 不透明 {:.2} 填充 {:.3} 形状 {} {:?} 剪 {} 穿 {}：{:?}", l.depth, l.props.blend, l.props.visible, l.props.opacity, l.props.fill, l.props.shapes, l.kind, l.props.clip, l.props.pass_through, p);
+                }
+            }
+        }
+    }
+
     /// 用户文件里带样式的图层，各自算一遍效果要多久（`ZHIBI_PSD_COMPARE` 指着那个 PSD）。
     #[test]
     #[ignore]
@@ -3483,16 +3660,136 @@ pub(crate) mod tests {
         for l in doc.layers().iter().filter(|l| l.style.as_ref().is_some_and(|s| s.shows())) {
             let t = std::time::Instant::now();
             let p = crate::style::render(&l.tiles, l.mask.as_ref(), &l.style.as_ref().unwrap().effects, doc.bounds(), &crate::style::PS_MODEL);
-            println!("{}：{} 个效果，{:.0} 毫秒", l.props.name, p.fx.len(), t.elapsed().as_secs_f64() * 1000.0);
+            println!("{}：{} 个效果，整层 {:.0} 毫秒", l.props.name, p.fx.len(), t.elapsed().as_secs_f64() * 1000.0);
+            // 在内容中间"画一笔"（改 100×100），看缓存只重算一片要多久。
+            let effects = &l.style.as_ref().unwrap().effects;
+            let cache = crate::style::Cache::default();
+            cache.get(&l.tiles, l.mask.as_ref(), effects, doc.bounds());
+            let c = content_bounds(&l.tiles, doc.bounds());
+            let (cx, cy) = ((c.x0 + c.x1) / 2, (c.y0 + c.y1) / 2);
+            let mut tiles = l.tiles.clone();
+            for y in cy..cy + 100 {
+                for x in cx..cx + 100 {
+                    let t = tiles.get_mut((x.div_euclid(TILE), y.div_euclid(TILE)));
+                    let k = ((y.rem_euclid(TILE)) * TILE + x.rem_euclid(TILE)) as usize * 4;
+                    t.0[k..k + 4].copy_from_slice(&[0, 0, 0, ONE as u16]);
+                }
+            }
+            let t = std::time::Instant::now();
+            cache.get(&tiles, l.mask.as_ref(), effects, doc.bounds());
+            println!("    画一笔之后只重算一片：{:.1} 毫秒", t.elapsed().as_secs_f64() * 1000.0);
         }
     }
 
-    /// 给窗口测试用：`ZHIBI_INTEROP_DIR` 里写一个带外发光图层的 PSD（`style.psd`）。
+    /// 给窗口测试用：`ZHIBI_INTEROP_DIR` 里写一个带外发光图层的 PSD（`style.psd`），
+    /// 和一个最上面是"颜色减淡、填充 34%"图层的 PSD（`fill.psd`）。
     #[test]
     #[ignore]
     fn write_style_window_doc() {
         let Some(dir) = interop_dir() else { return };
         save(&glowing_square(), &dir.join("style.psd")).unwrap();
+        let doc = glowing_square();
+        let mut layers = doc.layers().to_vec();
+        layers[1].style = None;
+        layers[1].props.blend = BlendMode::ColorDodge;
+        layers[1].props.fill = 87.0 / 255.0;
+        save(&Document::from_layers(doc.width, doc.height, doc.background, layers), &dir.join("fill.psd")).unwrap();
+    }
+
+    /// 内发光真的画到了图层上：方块里靠边的地方被染色，正中间（离边比发光的大小还远）不变。
+    #[test]
+    fn inner_glow_is_composited() {
+        let inner = V::Obj(
+            b"IrGl",
+            vec![
+                (b"enab", V::Bool(true)),
+                (b"Md  ", V::Enum(b"BlnM", b"Nrml")),
+                (b"Clr ", color(255.0, 0.0, 0.0)),
+                (b"Opct", V::Unit(b"#Prc", 100.0)),
+                (b"Ckmt", V::Unit(b"#Pxl", 0.0)),
+                (b"blur", V::Unit(b"#Pxl", 10.0)),
+                (b"Inpr", V::Unit(b"#Prc", 50.0)),
+                (b"glwS", V::Enum(b"IGSr", b"SrcE")),
+            ],
+        );
+        let block = lfx2(vec![(b"masterFXSwitch", V::Bool(true)), (b"IrGl", inner)]);
+        let mut doc = glowing_square();
+        let mut layers = doc.layers().to_vec();
+        layers[1].style = Some(parse_style(&[(*b"lfx2", block.as_slice())], None).0);
+        doc = Document::from_layers(doc.width, doc.height, doc.background, layers);
+        let edge = doc.pick(31, 50).unwrap();
+        assert!(edge[0] > 200 && edge[1] < 150, "{edge:?}");
+        assert_eq!(doc.pick(50, 50), Some([255; 3]));
+    }
+
+    /// 填充不透明度、透明形状图层：PSD 和原生格式存了再读都不变；新补的混合模式也一样。
+    #[test]
+    fn fill_opacity_and_new_blend_modes_survive_saving() {
+        let mut doc = sample_document();
+        let mut layers = doc.layers().to_vec();
+        layers[0].props.fill = 87.0 / 255.0;
+        layers[0].props.shapes = false;
+        layers[0].props.blend = BlendMode::ColorDodge;
+        layers[2].props.blend = BlendMode::Luminosity;
+        doc = Document::from_layers(doc.width, doc.height, doc.background, layers);
+        let tmp = Temp::new("fill.psd");
+        save(&doc, &tmp.0).unwrap();
+        let (back, notes) = load(&tmp.0).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let p = &back.layers()[0].props;
+        assert_eq!((p.fill, p.shapes, p.blend, back.layers()[2].props.blend), (87.0 / 255.0, false, BlendMode::ColorDodge, BlendMode::Luminosity));
+        let tmp = Temp::new("fill.zhibi");
+        crate::format::save(&doc, &tmp.0).unwrap();
+        let back = crate::format::load(&tmp.0).unwrap();
+        let p = &back.layers()[0].props;
+        assert_eq!((p.fill, p.shapes, p.blend), (87.0 / 255.0, false, BlendMode::ColorDodge));
+    }
+
+    /// 一个画板的 `artb` 块：矩形（上、左、下、右）和背景的种类。
+    fn artb(rect: [f64; 4], background: i32) -> Vec<u8> {
+        let mut out = 16u32.to_be_bytes().to_vec();
+        let r = V::Obj(b"classFloatRect", vec![(b"Top ", V::Doub(rect[0])), (b"Left", V::Doub(rect[1])), (b"Btom", V::Doub(rect[2])), (b"Rght", V::Doub(rect[3]))]);
+        put_descriptor(&mut out, b"artboard", &[(b"artboardRect", r), (b"artboardBackgroundType", V::Long(background))]);
+        out
+    }
+
+    /// 画板：白底垫在里面，"滤色"的图层叠在白底上还是白；矩形外的不显示；存回 PSD 原样不变。
+    #[test]
+    fn artboards_have_a_background_and_clip() {
+        let mut screen = Layer::new("滤色");
+        screen.depth = 1;
+        screen.props.blend = BlendMode::Screen;
+        let orange = to_premultiplied([240 * 257, 120 * 257, 20 * 257, 65535]);
+        for tc in crate::tile::tiles_in(Rect { x0: 0, y0: 0, x1: 100, y1: 60 }) {
+            for k in 0..(TILE * TILE) as usize {
+                screen.tiles.get_mut(tc).0[k * 4..k * 4 + 4].copy_from_slice(&orange);
+            }
+        }
+        let mut board = Layer::folder("画板");
+        board.props.pass_through = false;
+        let block = artb([0.0, 0.0, 40.0, 80.0], 1);
+        board.artboard = Some(parse_artboard(&[(*b"artb", block.as_slice())]));
+        assert_eq!(board.artboard.as_ref().unwrap().rect, Some(Rect { x0: 0, y0: 0, x1: 80, y1: 40 }));
+        let doc = Document::from_layers(100, 60, [10, 20, 30], vec![screen, board]);
+        // 画板里：滤色叠在白底上是白；画板外：什么都没有，露出文档的背景色。
+        assert_eq!(doc.pick(10, 10), Some([255; 3]));
+        assert_eq!(doc.pick(90, 10), Some([10, 20, 30]));
+        assert_eq!(doc.pick(10, 50), Some([10, 20, 30]));
+        let tmp = Temp::new("artboard.psd");
+        save(&doc, &tmp.0).unwrap();
+        let (back, notes) = load(&tmp.0).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(back.layers()[1].artboard, doc.layers()[1].artboard);
+        assert_eq!(back.pick(10, 10), Some([255; 3]));
+        let tmp = Temp::new("artboard.zhibi");
+        crate::format::save(&doc, &tmp.0).unwrap();
+        let back = crate::format::load(&tmp.0).unwrap();
+        assert_eq!(back.layers()[1].artboard, doc.layers()[1].artboard);
+        // 透明背景、读不懂的块。
+        let clear = parse_artboard(&[(*b"artb", artb([0.0, 0.0, 10.0, 10.0], 3).as_slice())]);
+        assert_eq!((clear.rect.is_some(), clear.background), (true, None));
+        let junk = parse_artboard(&[(*b"artb", &[0u8, 1, 2][..])]);
+        assert_eq!((junk.rect, junk.psd.len()), (None, 1));
     }
 
     #[test]
