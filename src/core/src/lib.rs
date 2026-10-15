@@ -5,8 +5,10 @@
 
 pub mod document;
 pub mod fill;
+pub mod filter;
 pub mod format;
 pub mod lang;
+pub mod liquify;
 pub mod ora;
 pub mod psd;
 pub mod selection;
@@ -15,6 +17,7 @@ pub mod stroke;
 pub mod tile;
 pub mod transform;
 pub mod view;
+pub mod warp;
 
 /// 15 位定点里的 1.0。通道值的范围是 0..=ONE。
 pub const ONE: u32 = 1 << 15;

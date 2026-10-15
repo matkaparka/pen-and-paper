@@ -39,10 +39,13 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use keys::{Key, Keymap};
 use ui::{Kind, Layout, Popup, SliderId};
-use xform::{Handle, Xform};
+use xform::{Handle, Mode, Xform};
 use zhibi_core::document::{BlendMode, Document, LayerProps, MAX_SIDE};
 use zhibi_core::fill::{self, FillOptions, Source};
+use zhibi_core::filter::{self, Adjust};
+use zhibi_core::liquify::{self, Liquify};
 use zhibi_core::selection::{Combine, Selection};
+use zhibi_core::tile::TileMap;
 use zhibi_core::stabilizer::Sample;
 use zhibi_core::stroke::{BrushParams, Stroke};
 use zhibi_core::transform::Quality;
@@ -88,6 +91,11 @@ const SWATCHES: &[[u8; 3]] = &[
 pub const MAX_GAP: u32 = 10;
 /// 按完"修饰键 + 按键"之后，这段时间内不理会修饰键（规格 F-151）。
 const MODIFIER_GRACE: Duration = Duration::from_millis(300);
+/// 液化时按着不动，每隔这么久补一下当前位置：转、收、鼓、复原按着不动也要接着起作用，
+/// 而鼠标不动时系统不会送消息来。
+const LIQUIFY_TICK: Duration = Duration::from_millis(15);
+/// 上面那个计时器的编号。
+const LIQUIFY_TIMER: usize = 2;
 
 // 系统询问"这个窗口要不要笔的长按、轻拂等手势"的消息，以及回答"都不要"的标志位。
 // 这些手势会让系统推迟报告落笔，对画布没有用处。
@@ -108,10 +116,12 @@ pub enum Tool {
     Lasso,
     Wand,
     Move,
+    /// 液化（规格 F-083）
+    Liquify,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 9] = [
+    pub const ALL: [Tool; 10] = [
         Tool::Pen,
         Tool::Marker,
         Tool::Airbrush,
@@ -121,6 +131,7 @@ impl Tool {
         Tool::Lasso,
         Tool::Wand,
         Tool::Move,
+        Tool::Liquify,
     ];
     /// 用笔刷引擎的四种工具。`App::brushes` 按这个顺序存它们的参数。
     const BRUSHES: [Tool; 4] = [Tool::Pen, Tool::Marker, Tool::Airbrush, Tool::Eraser];
@@ -141,6 +152,7 @@ impl Tool {
             Tool::Lasso => tr("套索", "Lasso"),
             Tool::Wand => tr("魔棒", "Wand"),
             Tool::Move => tr("移动", "Move"),
+            Tool::Liquify => tr("液化", "Liquify"),
         }
     }
 
@@ -238,22 +250,97 @@ pub enum Cmd {
     XformOk,
     XformCancel,
     XformReset,
+    /// 自由变换的方式：自由、扭曲、网格
+    XformMode(Mode),
     FlipH,
     FlipV,
     TurnCcw,
     TurnCw,
+    /// 液化的方式
+    LiquifyOp(liquify::Op),
+    /// 确定或者取消这次液化
+    LiquifyOk,
+    LiquifyCancel,
+    /// 打开一个滤镜（规格 F-095）
+    Filter(FilterKind),
+    FilterOk,
+    FilterCancel,
+    FilterReset,
+}
+
+/// 三个滤镜。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FilterKind {
+    HueSat,
+    BrightContrast,
+    Blur,
+}
+
+impl FilterKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterKind::HueSat => tr("色相/饱和度", "Hue/Saturation"),
+            FilterKind::BrightContrast => tr("亮度/对比度", "Brightness/Contrast"),
+            FilterKind::Blur => tr("模糊", "Blur"),
+        }
+    }
+
+    /// 参数都在零的这个滤镜。
+    fn zero(self) -> Adjust {
+        match self {
+            FilterKind::HueSat => Adjust::HueSat { hue: 0.0, saturation: 0.0, lightness: 0.0 },
+            FilterKind::BrightContrast => Adjust::BrightContrast { brightness: 0.0, contrast: 0.0 },
+            FilterKind::Blur => Adjust::Blur { radius: 0.0 },
+        }
+    }
+}
+
+/// 进行中的滤镜：从打开到确定或取消。拖滑块时整层从原图重算，换进图层预览。
+pub struct FilterSession {
+    pub kind: FilterKind,
+    pub params: Adjust,
+    layer: usize,
+    orig: TileMap,
+    sel: Option<Selection>,
+    keep_alpha: bool,
+    /// 参数变了，预览像素还没跟上
+    stale: bool,
+}
+
+impl FilterSession {
+    fn render(&self, clip: Rect) -> TileMap {
+        filter::apply(&self.orig, self.sel.as_ref(), &self.params, self.keep_alpha, clip)
+    }
 }
 
 impl Cmd {
-    /// 变换进行中也照常执行、不会把变换了结掉的命令：看图的，和变换自己的。
-    fn keeps_xform(self) -> bool {
+    /// 只是看图、换界面的命令：变换、液化进行中也照常执行，不会把它们了结掉。
+    fn just_looks(self) -> bool {
         use Cmd::*;
         matches!(
             self,
             ZoomIn | ZoomOut | Zoom100 | Fit | DefaultView | AngleZero | RotateCcw | RotateCw | Flip | TogglePanels | SwapColors
                 | SizeDown | SizeUp | StabilizerDown | StabilizerUp | ToggleOutline | ShowRgb | ShowHsv | ShowSwatches | PanelsRight
-                | SwatchAdd | SwatchRemove | PenPointer | PenWintab | MinPressure(_) | Language(_) | Transform | XformOk | XformCancel | XformReset | FlipH | FlipV | TurnCcw | TurnCw
+                | SwatchAdd | SwatchRemove | PenPointer | PenWintab | MinPressure(_) | Language(_)
         )
+    }
+
+    /// 变换进行中也照常执行、不会把变换了结掉的命令：看图的，和变换自己的。
+    fn keeps_xform(self) -> bool {
+        use Cmd::*;
+        self.just_looks() || matches!(self, Transform | XformOk | XformCancel | XformReset | XformMode(_) | FlipH | FlipV | TurnCcw | TurnCw)
+    }
+
+    /// 滤镜打开着也照常执行的命令：看图的，和滤镜自己的。
+    fn keeps_filter(self) -> bool {
+        use Cmd::*;
+        self.just_looks() || matches!(self, FilterOk | FilterCancel | FilterReset)
+    }
+
+    /// 液化进行中也照常执行的命令：看图的，和液化自己的。撤销、重做另外处理（撤的是液化里的一笔）。
+    fn keeps_liquify(self) -> bool {
+        use Cmd::*;
+        self.just_looks() || matches!(self, LiquifyOp(_) | LiquifyOk | LiquifyCancel | SelectTool(Tool::Liquify))
     }
 }
 
@@ -326,6 +413,15 @@ const MENUS: &[(&str, &str, &[MenuItem])] = &[
         ],
     ),
     (
+        "滤镜",
+        "Filter",
+        &[
+            (701, "色相/饱和度", "Hue/Saturation", Cmd::Filter(FilterKind::HueSat)),
+            (702, "亮度/对比度", "Brightness/Contrast", Cmd::Filter(FilterKind::BrightContrast)),
+            (703, "模糊", "Blur", Cmd::Filter(FilterKind::Blur)),
+        ],
+    ),
+    (
         "笔",
         "Pen",
         &[
@@ -377,6 +473,8 @@ enum Drag {
     Lasso,
     /// 正在拖变换的手柄（移动工具也走这里）
     Handle(Handle),
+    /// 正在液化
+    Liquify,
     /// 点一下就完成的操作（油漆桶、魔棒）已经做完，等松手
     Done,
 }
@@ -439,6 +537,15 @@ pub struct App {
     combine: Combine,
     /// 进行中的移动或自由变换
     xform: Option<Xform>,
+    /// 进行中的液化：从第一笔开始，到确定、取消或者做别的操作为止
+    liquify: Option<Liquify>,
+    /// 液化笔刷的方式、大小、强度
+    pub liquid: liquify::Brush,
+    /// 液化上一下是什么时候、压力多大（转、收、鼓、复原按时间起作用）
+    liquify_at: Option<Instant>,
+    liquify_pressure: f32,
+    /// 打开着的滤镜
+    pub filter: Option<FilterSession>,
     /// 油漆桶和魔棒的设置
     pub tolerance: u8,
     pub gap: u32,
@@ -498,9 +605,23 @@ impl App {
         &mut self.brushes[if self.tool.is_brush() { self.tool as usize } else { 0 }]
     }
 
-    /// 画布上要不要画笔刷大小的圆环：只有笔刷类工具才画。
+    /// 画布上要不要画笔刷大小的圆环：只有笔刷类工具和液化才画。
     fn shows_ring(&self) -> bool {
-        self.tool.is_brush() && self.xform.is_none()
+        (self.tool.is_brush() || self.tool == Tool::Liquify) && self.xform.is_none() && self.filter.is_none()
+    }
+
+    /// 撤销按钮能不能按：液化里还有可撤的笔，或者历史里有可撤的步骤。
+    pub fn can_undo(&self) -> bool {
+        self.doc.can_undo() || self.liquify.as_ref().is_some_and(|l| l.can_undo())
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.liquify.as_ref().map_or(self.doc.can_redo(), |l| l.can_redo())
+    }
+
+    /// 液化正在进行（面板上的确定、取消能不能按）。
+    pub fn liquifying(&self) -> bool {
+        self.liquify.is_some()
     }
 
     fn fill_options(&self) -> FillOptions {
@@ -508,9 +629,9 @@ impl App {
         FillOptions { tolerance: self.tolerance, gap: self.gap, source }
     }
 
-    /// 变换进行中时两个方向的缩放和角度（度），给面板显示用。
-    pub fn xform_readout(&self) -> Option<(f32, f32, f32)> {
-        self.xform.as_ref().filter(|x| !x.quick).map(|x| (x.scale.0.abs(), x.scale.1.abs(), x.angle.to_degrees()))
+    /// 进行中的自由变换（移动工具那种拖一下就确认的不算），给面板显示用。
+    pub fn xform_shown(&self) -> Option<&Xform> {
+        self.xform.as_ref().filter(|x| !x.quick)
     }
 
     pub fn color(&self) -> [u8; 3] {
@@ -576,7 +697,8 @@ impl App {
     fn ring_radius(&self) -> f32 {
         // 画不上的时候圆环里要画一道斜杠，太小了看不出来。
         let least = if self.doc.can_edit_active() { 1.5 } else { 8.0 };
-        (self.brush().size * self.view.zoom / 2.0).max(least)
+        let size = if self.tool == Tool::Liquify { self.liquid.size } else { self.brush().size };
+        (size * self.view.zoom / 2.0).max(least)
     }
 
     /// 把画布视口里的一块（视口内坐标）重画进后台缓冲，叠上光标圆环，再贴到窗口上。
@@ -608,13 +730,24 @@ impl App {
             _ => {}
         }
         if let Some(x) = self.xform.as_ref().filter(|x| !x.quick) {
-            outline(&x.corners().map(to_screen));
+            outline(&x.outline().into_iter().map(to_screen).collect::<Vec<_>>());
             let half = (4.0 * self.scale) as i32;
-            for (hx, hy) in [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)] {
-                knob(buf, stride, origin, rect, to_screen(x.handle(hx, hy)), half);
+            if x.mode == Mode::Mesh {
+                for line in x.mesh_lines() {
+                    for w in line.windows(2) {
+                        dashed(buf, stride, origin, rect, to_screen(w[0]), to_screen(w[1]));
+                    }
+                }
+                for k in 0..xform::MESH * xform::MESH {
+                    knob(buf, stride, origin, rect, to_screen(x.mesh_point(k)), half);
+                }
+            } else {
+                for (hx, hy) in [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)] {
+                    knob(buf, stride, origin, rect, to_screen(x.handle(hx, hy)), half);
+                }
             }
         }
-        if self.hovering && self.drag == Drag::None && self.shows_ring() {
+        if self.hovering && matches!(self.drag, Drag::None | Drag::Liquify) && self.shows_ring() {
             let r = self.ring_radius();
             draw_ring(buf, stride, origin, vp, self.last_pos, r);
             // 当前图层锁定或者隐藏着，画不上：圆环里加一道斜杠。
@@ -644,6 +777,7 @@ impl App {
     /// 整个窗口重画：界面和画布。
     fn paint(&mut self, hdc: HDC, dirty: &RECT) {
         self.flush_xform();
+        self.flush_filter();
         let Some(back) = self.back.as_ref() else { return };
         let (dc, size) = (back.dc, back.size);
         let buf = unsafe { std::slice::from_raw_parts_mut(back.bits, (size.0 * size.1) as usize) };
@@ -761,7 +895,7 @@ impl App {
             return false;
         }
         // 笔当橡皮用的时候临时换成橡皮工具，回到笔尖时换回原来的。只在两笔之间换，不打断正在画的一笔。
-        if self.stroke.is_none() && self.drag == Drag::None && self.xform.is_none() && eraser != self.pen_eraser.is_some() {
+        if self.stroke.is_none() && self.drag == Drag::None && self.xform.is_none() && self.liquify.is_none() && self.filter.is_none() && eraser != self.pen_eraser.is_some() {
             if eraser {
                 self.pen_eraser = Some(self.tool);
                 self.exec(Cmd::SelectTool(Tool::Eraser));
@@ -783,6 +917,7 @@ impl App {
         if self.drag == Drag::None {
             self.canvas_changed(dirty);
         }
+        self.flush_liquify();
         true
     }
 
@@ -812,11 +947,16 @@ impl App {
                     return Rect::EMPTY;
                 }
                 Drag::Lasso => self.lasso.push(c),
-                Drag::Handle(handle) => {
+                Drag::Handle(_) => {
                     let shift = key_down(VK_SHIFT.0);
                     if let Some(x) = self.xform.as_mut() {
-                        x.drag(handle, c, shift);
+                        x.drag(c, shift);
                     }
+                }
+                Drag::Liquify => {
+                    // 液化每来一个样本只改位移场；画面在这一批样本处理完后一起更新（`flush_liquify`）。
+                    self.liquify_dab(c, pressure);
+                    return Rect::EMPTY;
                 }
                 Drag::Marquee => {}
                 Drag::Done | Drag::None => return Rect::EMPTY,
@@ -849,20 +989,27 @@ impl App {
             self.refresh_all();
             return Rect::EMPTY;
         }
-        // 变换进行中，画布上只认外框和手柄。
+        // 变换进行中，画布上只认外框和手柄。按着 Ctrl 时拖角是扭曲、拖边是斜切。
         let reach = 9.0 * self.scale;
         if let Some(x) = self.xform.as_mut() {
-            let handle = x.hit(pos, |p| view.to_screen(p, vp), reach);
-            x.grab(c);
+            let handle = x.hit(pos, |p| view.to_screen(p, vp), reach, ctrl);
+            x.grab(handle, c);
             self.drag = Drag::Handle(handle);
+            return Rect::EMPTY;
+        }
+        // 滤镜打开着：画布上只能看，不能画。
+        if self.filter.is_some() {
+            self.drag = Drag::Done;
             return Rect::EMPTY;
         }
         // 移动工具；用别的工具时按住 Ctrl 拖动也是移动（规格 F-081）。
         if ctrl || self.tool == Tool::Move {
             self.drag = Drag::Done;
+            // 液化里按住 Ctrl 拖动：先把液化确定下来，移动的是液化之后的像素。
+            self.end_liquify(true);
             if self.begin_xform(true) {
                 if let Some(x) = self.xform.as_mut() {
-                    x.grab(c);
+                    x.grab(Handle::Move, c);
                 }
                 self.drag = Drag::Handle(Handle::Move);
             }
@@ -897,6 +1044,22 @@ impl App {
             }
             // 当前图层锁定或者隐藏着：不开始这一笔。
             _ if !self.doc.can_edit_active() => self.drag = Drag::Done,
+            Tool::Liquify => {
+                if self.liquify.is_none() {
+                    self.liquify = Liquify::begin(&self.doc);
+                    self.refresh_ui();
+                }
+                let Some(l) = self.liquify.as_mut() else {
+                    self.drag = Drag::Done;
+                    return Rect::EMPTY;
+                };
+                l.press(c);
+                self.drag = Drag::Liquify;
+                (self.liquify_at, self.liquify_pressure) = (Some(Instant::now()), sample.p);
+                unsafe {
+                    SetTimer(Some(self.hwnd), LIQUIFY_TIMER, LIQUIFY_TICK.as_millis() as u32, None);
+                }
+            }
             Tool::Bucket => {
                 self.drag = Drag::Done;
                 let (color, opts) = (self.color(), self.fill_options());
@@ -933,6 +1096,17 @@ impl App {
             Drag::Handle(_) => {
                 if self.xform.as_ref().is_some_and(|x| x.quick) {
                     self.end_xform(true);
+                }
+                None
+            }
+            Drag::Liquify => {
+                self.flush_liquify();
+                if let Some(l) = self.liquify.as_mut() {
+                    l.release();
+                }
+                self.liquify_at = None;
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), LIQUIFY_TIMER);
                 }
                 None
             }
@@ -996,6 +1170,108 @@ impl App {
         self.display.invalidate_all();
     }
 
+    /// 液化的一下：按离上一下过了多久算转、收、鼓、复原的量。
+    fn liquify_dab(&mut self, c: (f32, f32), pressure: f32) {
+        let now = Instant::now();
+        let dt = self.liquify_at.map_or(0.0, |t| (now - t).as_secs_f32());
+        (self.liquify_at, self.liquify_pressure) = (Some(now), pressure);
+        let brush = self.liquid;
+        if let Some(l) = self.liquify.as_mut() {
+            l.dab(&brush, c, pressure, dt);
+        }
+    }
+
+    /// 位移场变了的分块重算预览像素，换进图层，屏幕上只重画那一块。一批笔样本处理完才做一次。
+    fn flush_liquify(&mut self) {
+        let Some(l) = self.liquify.as_mut() else { return };
+        let (layer, (dirty, part)) = (l.layer, l.take_preview());
+        if dirty.is_empty() {
+            return;
+        }
+        self.doc.set_layer_part_live(layer, part);
+        self.canvas_changed(dirty);
+    }
+
+    /// 液化时按着不动：每隔一会儿在当前位置补一下。笔在动时样本自己会来，不用补。
+    fn liquify_tick(&mut self) {
+        if self.drag != Drag::Liquify {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), LIQUIFY_TIMER);
+            }
+            return;
+        }
+        if self.liquify_at.is_some_and(|t| t.elapsed() >= LIQUIFY_TICK) {
+            let c = self.view.to_canvas(self.last_pos, self.vp());
+            self.liquify_dab(c, self.liquify_pressure);
+            self.flush_liquify();
+        }
+    }
+
+    /// 撤销或重做液化里的一笔。液化里没有可撤（可重做）的笔时返回 false。
+    fn liquify_history(&mut self, redo: bool) -> bool {
+        let Some(l) = self.liquify.as_mut() else { return false };
+        if !(if redo { l.redo() } else { l.undo() }) {
+            return false;
+        }
+        self.flush_liquify();
+        self.refresh_ui();
+        true
+    }
+
+    /// 结束液化。`keep` 为 false 时放弃，图层回到液化之前；确定时整次液化在历史里是一步。
+    fn end_liquify(&mut self, keep: bool) {
+        let Some(l) = self.liquify.take() else { return };
+        if self.drag == Drag::Liquify {
+            self.drag = Drag::None;
+        }
+        // 预览期间图层里放的是预览用的像素，先换回原图。
+        self.doc.set_layer_tiles_live(l.layer, l.orig().clone());
+        if keep && l.touched() {
+            self.doc.replace_layer_tiles(l.layer, l.result());
+        }
+        self.document_changed();
+    }
+
+    /// 打开一个滤镜（规格 F-095）。当前图层锁定或者隐藏着时什么也不做。
+    fn begin_filter(&mut self, kind: FilterKind) {
+        if !self.doc.can_edit_active() {
+            return;
+        }
+        let layer = self.doc.active();
+        let l = &self.doc.layers()[layer];
+        self.filter = Some(FilterSession { kind, params: kind.zero(), layer, orig: l.tiles.clone(), sel: self.doc.selection().cloned(), keep_alpha: l.props.lock_alpha, stale: false });
+        self.refresh_all();
+    }
+
+    /// 滤镜的参数变了之后，把预览像素重算一遍。放在重画之前做，连着拖几下滑块只算一次。
+    fn flush_filter(&mut self) {
+        let clip = self.doc.bounds();
+        let Some(f) = self.filter.as_mut().filter(|f| f.stale) else { return };
+        f.stale = false;
+        let (layer, tiles) = (f.layer, f.render(clip));
+        self.doc.set_layer_tiles_live(layer, tiles);
+        self.display.invalidate_all();
+    }
+
+    /// 关掉滤镜。`keep` 为 false 时放弃，图层回到打开滤镜之前；确定时在历史里是一步。
+    fn end_filter(&mut self, keep: bool) {
+        let Some(f) = self.filter.take() else { return };
+        self.doc.set_layer_tiles_live(f.layer, f.orig.clone());
+        if keep && !f.params.is_identity() {
+            let tiles = f.render(self.doc.bounds());
+            self.doc.replace_layer_tiles(f.layer, tiles);
+        }
+        self.document_changed();
+    }
+
+    /// 把进行中的变换、液化和滤镜都确定下来（关窗口、换文件之前）。
+    fn settle(&mut self) {
+        self.drag = Drag::None;
+        self.end_xform(true);
+        self.end_liquify(true);
+        self.end_filter(true);
+    }
+
     fn finish_stroke(&mut self) -> Rect {
         let Some(mut stroke) = self.stroke.take() else { return Rect::EMPTY };
         let tail = stroke.end();
@@ -1023,13 +1299,18 @@ impl App {
     }
 
     fn step_size(&mut self, up: bool) {
-        if !self.tool.is_brush() {
+        let liquid = self.tool == Tool::Liquify;
+        if !self.tool.is_brush() && !liquid {
             return;
         }
-        let cur = self.brush().size;
+        let cur = if liquid { self.liquid.size } else { self.brush().size };
         let next = if up { SIZES.iter().copied().find(|&s| s > cur + 0.01) } else { SIZES.iter().rev().copied().find(|&s| s < cur - 0.01) };
         if let Some(next) = next {
-            self.brush_mut().size = next;
+            if liquid {
+                self.liquid.size = next;
+            } else {
+                self.brush_mut().size = next;
+            }
             self.canvas_changed(Rect::EMPTY);
             self.refresh_ui();
         }
@@ -1043,6 +1324,26 @@ impl App {
             self.end_xform(cmd != Cmd::Undo);
             if cmd == Cmd::Undo {
                 return None;
+            }
+        }
+        // 滤镜打开着：看图的命令照常执行，别的命令先把滤镜确定下来。撤销在这时等于取消。
+        if self.filter.is_some() && !cmd.keeps_filter() {
+            self.end_filter(cmd != Cmd::Undo);
+            if cmd == Cmd::Undo {
+                return None;
+            }
+        }
+        // 液化进行中：撤销、重做的是液化里的一笔；撤到第一笔之前再撤，就是取消这次液化，接着撤历史里的。
+        // 别的命令先把液化确定下来。
+        if self.liquify.is_some() && !cmd.keeps_liquify() {
+            match cmd {
+                Cmd::Undo if self.liquify_history(false) => return None,
+                Cmd::Undo => self.end_liquify(false),
+                Cmd::Redo => {
+                    self.liquify_history(true);
+                    return None;
+                }
+                _ => self.end_liquify(true),
             }
         }
         let vp = self.vp();
@@ -1238,6 +1539,25 @@ impl App {
                 }
                 self.refresh_all();
             }
+            Cmd::XformMode(mode) => {
+                if let Some(x) = self.xform.as_mut() {
+                    x.mode = mode;
+                }
+                self.refresh_all();
+            }
+            Cmd::LiquifyOp(op) => {
+                self.liquid.op = op;
+                self.refresh_ui();
+            }
+            Cmd::LiquifyOk | Cmd::LiquifyCancel => self.end_liquify(cmd == Cmd::LiquifyOk),
+            Cmd::Filter(kind) => self.begin_filter(kind),
+            Cmd::FilterOk | Cmd::FilterCancel => self.end_filter(cmd == Cmd::FilterOk),
+            Cmd::FilterReset => {
+                if let Some(f) = self.filter.as_mut() {
+                    (f.params, f.stale) = (f.kind.zero(), true);
+                }
+                self.refresh_all();
+            }
             Cmd::FlipH | Cmd::FlipV | Cmd::TurnCcw | Cmd::TurnCw => {
                 // 不在变换里时，这几条是一步到位的图层操作（规格 F-082）；在变换里时只是改当前的变换。
                 let single = self.xform.is_none();
@@ -1291,6 +1611,19 @@ impl App {
             SliderId::Hsv(_) => self.hsv.2 = t,
             SliderId::Tolerance => self.tolerance = (t * 255.0).round() as u8,
             SliderId::Gap => self.gap = (t * MAX_GAP as f32).round() as u32,
+            SliderId::LiquifySize => {
+                self.liquid.size = ui::slider_to_size(t);
+                self.canvas_changed(Rect::EMPTY);
+            }
+            SliderId::LiquifyStrength => self.liquid.strength = pct,
+            SliderId::Filter(i) => {
+                if let Some(f) = self.filter.as_mut() {
+                    f.params = ui::set_filter_param(f.params, i, t);
+                    f.stale = true;
+                }
+                self.refresh_all();
+                return;
+            }
             SliderId::LayerOpacity => {
                 let index = self.doc.active();
                 let props = self.doc.layers()[index].props.clone();
@@ -1364,8 +1697,10 @@ impl App {
                             self.document_changed();
                         } else {
                             // 换图层之前先把进行中的变换确认下来，免得它留在别的图层上。
-                            if self.xform.is_some() && index != self.doc.active() {
+                            if index != self.doc.active() {
                                 self.end_xform(true);
+                                self.end_liquify(true);
+                                self.end_filter(true);
                             }
                             self.doc.set_active(index);
                             self.refresh_ui();
@@ -1407,6 +1742,14 @@ impl App {
             Cmd::XformOk
         } else if vk == VK_ESCAPE.0 && self.xform.is_some() {
             Cmd::XformCancel
+        } else if vk == VK_RETURN.0 && self.filter.is_some() {
+            Cmd::FilterOk
+        } else if vk == VK_ESCAPE.0 && self.filter.is_some() {
+            Cmd::FilterCancel
+        } else if vk == VK_RETURN.0 && self.liquify.is_some() && self.drag != Drag::Liquify {
+            Cmd::LiquifyOk
+        } else if vk == VK_ESCAPE.0 && self.liquify.is_some() && self.drag != Drag::Liquify {
+            Cmd::LiquifyCancel
         } else if vk == VK_ESCAPE.0 && matches!(self.drag, Drag::Marquee | Drag::Lasso) {
             // 选框或套索拖到一半按 Esc：这一次不算。
             self.drag = Drag::Done;
@@ -1488,6 +1831,9 @@ impl App {
         s.set("pen.wintab", self.tablet.is_some() as usize);
         s.set("pen.min_pressure", (self.min_pressure * 100.0).round() as usize);
         s.set("lang", if lang::english() { "en" } else { "zh" });
+        s.set("liquify.op", self.liquid.op.id());
+        s.set("liquify.size", self.liquid.size);
+        s.set("liquify.strength", self.liquid.strength);
         let hex: Vec<String> = self.swatches.iter().map(|c| format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2])).collect();
         s.set("swatches", hex.join(","));
         self.keymap.save(&mut s);
@@ -1750,6 +2096,15 @@ fn main() -> Result<()> {
                 lasso: Vec::new(),
                 combine: Combine::Replace,
                 xform: None,
+                liquify: None,
+                liquid: liquify::Brush {
+                    op: saved.text("liquify.op").and_then(liquify::Op::from_id).unwrap_or(liquify::Op::Push),
+                    size: saved.f32("liquify.size", 100.0).clamp(1.0, 500.0),
+                    strength: saved.f32("liquify.strength", 0.5).clamp(0.0, 1.0),
+                },
+                liquify_at: None,
+                liquify_pressure: 1.0,
+                filter: None,
                 tolerance: saved.usize("fill.tolerance", 24).min(255) as u8,
                 gap: (saved.usize("fill.gap", 0) as u32).min(MAX_GAP),
                 fill_merged: saved.usize("fill.merged", 1) != 0,
@@ -1892,6 +2247,7 @@ unsafe fn on_mouse(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<Later
         if app.drag == Drag::None {
             app.canvas_changed(dirty);
         }
+        app.flush_liquify();
         None
     })
     .flatten()
@@ -1955,6 +2311,8 @@ fn replace_document(doc: Document, path: Option<PathBuf>, foreign: bool) {
         app.foreign = foreign;
         app.stroke = None;
         app.xform = None;
+        app.liquify = None;
+        app.filter = None;
         app.drag = Drag::None;
         app.lasso.clear();
         app.display.invalidate_all();
@@ -2260,7 +2618,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
+            WM_TIMER if wp.0 == LIQUIFY_TIMER => {
+                with_app(|app| app.liquify_tick());
+                LRESULT(0)
+            }
             WM_CLOSE => {
+                // 进行中的变换、液化先确定下来，这样"要不要保存"问得对。
+                with_app(|app| app.settle());
                 if may_discard(hwnd) {
                     with_app(|app| app.save_settings());
                     let _ = DestroyWindow(hwnd);

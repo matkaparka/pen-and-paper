@@ -649,6 +649,14 @@ impl Document {
         std::mem::replace(&mut self.layers[index].tiles, tiles)
     }
 
+    /// 只换掉某一层的几个分块，不记撤销（液化时的实时预览，每动一下只换笔刷碰到的那几块）。
+    pub fn set_layer_part_live(&mut self, index: usize, tiles: impl IntoIterator<Item = (TileCoord, Option<Arc<Tile>>)>) {
+        let layer = &mut self.layers[index].tiles;
+        for (tc, t) in tiles {
+            layer.replace(tc, t);
+        }
+    }
+
     /// 改图层属性但不记撤销，用于拖动滑块时的实时预览。
     pub fn set_props_live(&mut self, index: usize, props: LayerProps) {
         if let Some(l) = self.layers.get_mut(index) {

@@ -11,6 +11,9 @@ use windows::Win32::Graphics::Gdi::{
     DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, HDC, HFONT, TRANSPARENT,
 };
 
+use crate::xform::Mode;
+use zhibi_core::filter::Adjust;
+use zhibi_core::liquify::Op;
 use crate::{App, Cmd, Tool, MAX_GAP, MAX_SWATCHES, SIZES};
 use zhibi_core::lang::{english, tr};
 use zhibi_core::trf;
@@ -37,6 +40,11 @@ pub enum SliderId {
     Tolerance,
     /// 油漆桶和魔棒的缝隙闭合
     Gap,
+    /// 液化笔刷的大小、强度
+    LiquifySize,
+    LiquifyStrength,
+    /// 打开着的滤镜的第几个滑块
+    Filter(u8),
     /// 前景色的红、绿、蓝（0、1、2）
     Rgb(u8),
     /// 前景色的色相、饱和度、明度（0、1、2）
@@ -78,6 +86,46 @@ pub struct Layout {
 
 pub fn contains(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+/// 滤镜的各个滑块：名字、滑块位置（0 到 1）、显示的数值。
+pub fn filter_sliders(a: &Adjust) -> Vec<(&'static str, f32, String)> {
+    // 有正有负的参数，滑块正中是零。
+    let mid = |v: f32| (v + 1.0) / 2.0;
+    let signed = |v: f32| format!("{:+.0}", v * 100.0);
+    match *a {
+        Adjust::HueSat { hue, saturation, lightness } => vec![
+            (tr("色相", "Hue"), mid(hue / 180.0), format!("{hue:+.0}°")),
+            (tr("饱和度", "Saturation"), mid(saturation), signed(saturation)),
+            (tr("明度", "Lightness"), mid(lightness), signed(lightness)),
+        ],
+        Adjust::BrightContrast { brightness, contrast } => {
+            vec![(tr("亮度", "Brightness"), mid(brightness), signed(brightness)), (tr("对比度", "Contrast"), mid(contrast), signed(contrast))]
+        }
+        // 半径按平方根铺在滑块上：小半径那一头分得细。
+        Adjust::Blur { radius } => vec![(tr("半径", "Radius"), (radius / 100.0).sqrt(), trf!("{} 像素", "{} px", radius))],
+    }
+}
+
+/// 第 `i` 个滑块拖到 `t`（0 到 1）之后的参数。数值取整到滑块上显示的那一位。
+pub fn set_filter_param(a: Adjust, i: u8, t: f32) -> Adjust {
+    // 加 0.0 是为了把 −0 变成 0，免得显示成"−0"。
+    let signed = |t: f32| ((t * 2.0 - 1.0) * 100.0).round() / 100.0 + 0.0;
+    match a {
+        Adjust::HueSat { hue, saturation, lightness } => match i {
+            0 => Adjust::HueSat { hue: ((t * 2.0 - 1.0) * 180.0).round() + 0.0, saturation, lightness },
+            1 => Adjust::HueSat { hue, saturation: signed(t), lightness },
+            _ => Adjust::HueSat { hue, saturation, lightness: signed(t) },
+        },
+        Adjust::BrightContrast { brightness, contrast } => match i {
+            0 => Adjust::BrightContrast { brightness: signed(t), contrast },
+            _ => Adjust::BrightContrast { brightness, contrast: signed(t) },
+        },
+        Adjust::Blur { .. } => {
+            let r = 100.0 * t * t;
+            Adjust::Blur { radius: if r < 10.0 { (r * 10.0).round() / 10.0 } else { r.round() } }
+        }
+    }
 }
 
 /// 笔刷大小与滑块位置的换算：对数刻度，小笔刷那一头分得细。
@@ -143,8 +191,8 @@ pub fn build(app: &App, client: (i32, i32)) -> Layout {
     };
     // 英文的字比中文长，按钮按语言给不同的宽度。
     let w = |zh: f32, en: f32| if english() { en } else { zh };
-    bar(&mut items, tr("撤销", "Undo").into(), Cmd::Undo, false, app.doc.can_undo(), w(52.0, 56.0), 2.0);
-    bar(&mut items, tr("重做", "Redo").into(), Cmd::Redo, false, app.doc.can_redo(), w(52.0, 56.0), 18.0);
+    bar(&mut items, tr("撤销", "Undo").into(), Cmd::Undo, false, app.can_undo(), w(52.0, 56.0), 2.0);
+    bar(&mut items, tr("重做", "Redo").into(), Cmd::Redo, false, app.can_redo(), w(52.0, 56.0), 18.0);
     bar(&mut items, tr("缩小", "Zoom −").into(), Cmd::ZoomOut, false, true, w(48.0, 64.0), 2.0);
     bar(&mut items, format!("{:.0}%", app.view.zoom * 100.0), Cmd::Zoom100, false, true, 64.0, 2.0);
     bar(&mut items, tr("放大", "Zoom +").into(), Cmd::ZoomIn, false, true, w(48.0, 64.0), 2.0);
@@ -245,17 +293,52 @@ pub fn build(app: &App, client: (i32, i32)) -> Layout {
     // 工具下面这一块跟着当前工具换内容；变换进行中时换成变换的选项和确定、取消（规格 F-080）。
     let selected = app.doc.selection().is_some();
 
-    if let Some((sx, sy, angle)) = app.xform_readout() {
+    if let Some(x) = app.xform_shown() {
         label(&mut items, &mut y, tr("自由变换", "Free Transform").into());
-        label(&mut items, &mut y, trf!("宽 {:.0}%　高 {:.0}%　转 {:.1}°", "W {:.0}%  H {:.0}%  {:.1}°", sx * 100.0, sy * 100.0, angle));
+        label(&mut items, &mut y, trf!("宽 {:.0}%　高 {:.0}%　转 {:.1}°", "W {:.0}%  H {:.0}%  {:.1}°", x.scale.0.abs() * 100.0, x.scale.1.abs() * 100.0, x.angle.to_degrees()));
+        // 宽、高、角度说的只是外框的位置；做过扭曲或网格变形的，另起一行注明。
+        let extra = match (x.warped(), x.bent()) {
+            (true, true) => Some(tr("另有扭曲和网格变形", "Plus distortion and warp")),
+            (true, false) => Some(tr("另有扭曲", "Plus distortion")),
+            (false, true) => Some(tr("另有网格变形", "Plus warp")),
+            (false, false) => None,
+        };
+        if let Some(text) = extra {
+            label(&mut items, &mut y, text.into());
+        }
         y += px(4.0);
         row(&mut items, &mut y, &[(tr("确定  Enter", "OK  Enter"), Cmd::XformOk, true, true), (tr("取消  Esc", "Cancel  Esc"), Cmd::XformCancel, false, true)]);
+        y += px(6.0);
+        let modes = [(tr("自由", "Free"), Mode::Free), (tr("扭曲", "Distort"), Mode::Distort), (tr("网格", "Warp"), Mode::Mesh)];
+        row(&mut items, &mut y, &modes.map(|(text, mode)| (text, Cmd::XformMode(mode), x.mode == mode, true)));
         y += px(6.0);
         row(&mut items, &mut y, &[(tr("左右翻转", "Flip Horizontal"), Cmd::FlipH, false, true), (tr("上下翻转", "Flip Vertical"), Cmd::FlipV, false, true)]);
         row(&mut items, &mut y, &[(tr("左转 90°", "Rotate 90° Left"), Cmd::TurnCcw, false, true), (tr("右转 90°", "Rotate 90° Right"), Cmd::TurnCw, false, true)]);
         row(&mut items, &mut y, &[(tr("复位", "Reset"), Cmd::XformReset, false, true)]);
         y += px(6.0);
-        for hint in [tr("拖角：缩放（按住 Shift 可以变形）", "Corner: scale (Shift: free)"), tr("拖边：只拉一个方向", "Edge: stretch one way"), tr("框内拖动：移动", "Inside: move"), tr("框外拖动：旋转（Shift 每档 15°）", "Outside: rotate (Shift: 15°)")] {
+        let hints: &[&str] = match x.mode {
+            Mode::Free => &[
+                tr("拖角：缩放（按住 Shift 可以变形）", "Corner: scale (Shift: free)"),
+                tr("拖边：只拉一个方向", "Edge: stretch one way"),
+                tr("按住 Ctrl 拖角、拖边：扭曲、斜切", "Ctrl+drag: distort, skew"),
+            ],
+            Mode::Distort => &[tr("拖角：只动这一个角", "Corner: move this corner only"), tr("拖边：斜切", "Edge: skew")],
+            Mode::Mesh => &[tr("拖网格上的点：画面跟着弯", "Drag a point to bend the picture")],
+        };
+        for hint in hints.iter().chain(&[tr("框内拖动：移动", "Inside: move"), tr("框外拖动：旋转（Shift 每档 15°）", "Outside: rotate (Shift: 15°)")]) {
+            label(&mut items, &mut y, (*hint).into());
+        }
+    } else if let Some(f) = app.filter.as_ref() {
+        // 滤镜打开着：面板换成它的滑块和确定、取消（规格 F-095），不弹对话框。
+        label(&mut items, &mut y, f.kind.label().into());
+        for (i, (name, value, text)) in filter_sliders(&f.params).into_iter().enumerate() {
+            slider(&mut items, &mut y, name, value, text, SliderId::Filter(i as u8));
+        }
+        y += px(4.0);
+        row(&mut items, &mut y, &[(tr("确定  Enter", "OK  Enter"), Cmd::FilterOk, true, true), (tr("取消  Esc", "Cancel  Esc"), Cmd::FilterCancel, false, true)]);
+        row(&mut items, &mut y, &[(tr("复位", "Reset"), Cmd::FilterReset, false, true)]);
+        y += px(6.0);
+        for hint in [tr("拖滑块，画布跟着变", "The canvas follows the sliders"), tr("只改当前图层", "Changes the current layer only"), tr("有选区时只改选区里", "With a selection: only inside it")] {
             label(&mut items, &mut y, hint.into());
         }
     } else if app.tool.is_brush() {
@@ -298,6 +381,38 @@ pub fn build(app: &App, client: (i32, i32)) -> Layout {
                 } else {
                     label(&mut items, &mut y, tr("点一下：选中颜色相近的一片", "Click: select similar colors").into());
                     label(&mut items, &mut y, tr("Shift 加选，Alt 减选", "Shift: add, Alt: subtract").into());
+                }
+            }
+            Tool::Liquify => {
+                // 六种方式两行，每行三个（规格 F-083）。
+                let ops = [
+                    (tr("推", "Push"), Op::Push),
+                    (tr("顺时针转", "Twirl CW"), Op::TwirlCw),
+                    (tr("逆时针转", "Twirl CCW"), Op::TwirlCcw),
+                    (tr("收缩", "Pinch"), Op::Pinch),
+                    (tr("膨胀", "Bloat"), Op::Bloat),
+                    (tr("复原", "Restore"), Op::Restore),
+                ]
+                .map(|(text, op)| (text, Cmd::LiquifyOp(op), app.liquid.op == op, true));
+                row(&mut items, &mut y, &ops[..3]);
+                row(&mut items, &mut y, &ops[3..]);
+                y += px(4.0);
+                let b = app.liquid;
+                slider(&mut items, &mut y, tr("大小", "Size"), size_to_slider(b.size), format!("{}", b.size), SliderId::LiquifySize);
+                slider(&mut items, &mut y, tr("强度", "Strength"), b.strength, pct(b.strength), SliderId::LiquifyStrength);
+                y += px(6.0);
+                let on = app.liquifying();
+                row(&mut items, &mut y, &[(tr("确定  Enter", "OK  Enter"), Cmd::LiquifyOk, on, on), (tr("取消  Esc", "Cancel  Esc"), Cmd::LiquifyCancel, false, on)]);
+                y += px(6.0);
+                let how = match b.op {
+                    Op::Push => tr("拖动：把像素推着走", "Drag: push pixels along"),
+                    Op::TwirlCw | Op::TwirlCcw => tr("按住：绕笔刷中心转，越久转得越多", "Hold: twirl, longer turns more"),
+                    Op::Pinch => tr("按住：往笔刷中心收", "Hold: pull toward the center"),
+                    Op::Bloat => tr("按住：从笔刷中心往外鼓", "Hold: push out from the center"),
+                    Op::Restore => tr("涂过的地方回到液化之前", "Paint back the original"),
+                };
+                for hint in [how, tr("压得越重越强", "Press harder for more"), tr("确定之前，每一笔都能撤销", "Each stroke can be undone"), tr("换工具、做别的操作时自动确定", "Other tools apply it")] {
+                    label(&mut items, &mut y, hint.into());
                 }
             }
             Tool::Select | Tool::Lasso => {
@@ -600,15 +715,41 @@ mod tests {
     use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC, GetTextExtentPoint32W};
 
+    #[test]
+    fn filter_sliders_map_both_ways() {
+        let zero = [Adjust::HueSat { hue: 0.0, saturation: 0.0, lightness: 0.0 }, Adjust::BrightContrast { brightness: 0.0, contrast: 0.0 }, Adjust::Blur { radius: 0.0 }];
+        for a in zero {
+            let n = filter_sliders(&a).len();
+            for i in 0..n as u8 {
+                // 有正负的滑块正中是零（显示"+0"而不是"−0"），两头是上下限。
+                let lo = set_filter_param(a, i, 0.0);
+                let hi = set_filter_param(a, i, 1.0);
+                if !matches!(a, Adjust::Blur { .. }) {
+                    let mid = set_filter_param(a, i, 0.5);
+                    assert!(mid.is_identity(), "{mid:?}");
+                    assert!(filter_sliders(&mid).iter().all(|s| !s.2.starts_with('-')), "{mid:?}");
+                }
+                for (b, t) in [(lo, 0.0), (hi, 1.0)] {
+                    let back = filter_sliders(&b)[i as usize].1;
+                    assert!((back - t).abs() < 1e-3, "{b:?}: {back}");
+                }
+            }
+        }
+        // 半径：小的那一头分得细，取整到 0.1 像素；10 以上取整到 1 像素。
+        assert_eq!(set_filter_param(zero[2], 0, 0.1), Adjust::Blur { radius: 1.0 });
+        assert_eq!(set_filter_param(zero[2], 0, 0.5), Adjust::Blur { radius: 25.0 });
+        assert_eq!(set_filter_param(zero[0], 0, 0.75), Adjust::HueSat { hue: 90.0, saturation: 0.0, lightness: 0.0 });
+    }
+
     /// 英文界面里最紧的几处：字要放得下（按 100% 缩放量，宽度单位是逻辑像素，两边共留 4 像素）。
     /// 宽度照 `build` 里的算法：左列内容宽 244，工具按钮四列各 58，图层面板三列各 68，
     /// 左列三个一排各 78、两个一排各 120，稳定器下拉框扣掉边距和箭头后约 100。
     #[test]
     fn english_labels_fit_their_buttons() {
         let cases: &[(&[&str], i32)] = &[
-            (&["Pen", "Marker", "Airbrush", "Eraser", "Bucket", "Select", "Lasso", "Wand", "Move"], 58),
+            (&["Pen", "Marker", "Airbrush", "Eraser", "Bucket", "Select", "Lasso", "Wand", "Move", "Liquify"], 58),
             (&["Lock α", "Lock", "Clip", "New", "Copy", "Delete", "Up", "Down", "Merge"], 68),
-            (&["All", "None", "Invert"], 78),
+            (&["All", "None", "Invert", "Free", "Distort", "Warp", "Push", "Twirl CW", "Twirl CCW", "Pinch", "Bloat", "Restore"], 78),
             (
                 &[
                     "Flip Horizontal", "Flip Vertical", "Rotate 90° Left", "Rotate 90° Right", "Save Color", "Remove Color",
@@ -623,6 +764,11 @@ mod tests {
                     "Leaking? Raise Gap Closing", "Click: select similar colors", "Shift: add, Alt: subtract", "Drag: select a rectangle",
                     "Drag: draw around an area", "Painting stays inside a selection", "Drag: move the layer",
                     "With a selection: only that part", "Ctrl+drag works with any tool", "W 100%  H 100%  -180.0°",
+                    "Ctrl+drag: distort, skew", "Corner: move this corner only", "Edge: skew", "Drag a point to bend the picture",
+                    "Plus distortion and warp", "Drag: push pixels along", "Hold: twirl, longer turns more", "Hold: pull toward the center",
+                    "Hold: push out from the center", "Paint back the original", "Press harder for more", "Each stroke can be undone",
+                    "Other tools apply it", "Brightness/Contrast", "The canvas follows the sliders", "Changes the current layer only",
+                    "With a selection: only inside it",
                 ],
                 244,
             ),

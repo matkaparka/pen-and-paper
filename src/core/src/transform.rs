@@ -253,6 +253,12 @@ pub fn transform_selection(sel: &Selection, m: &Affine, clip: Rect) -> Selection
     if Mat64::of(m).inverse().is_none() {
         return Selection::empty();
     }
+    let image = transform_tiles(&selection_image(sel), None, m, Quality::Best, clip);
+    image_selection(&image, clip)
+}
+
+/// 选区的覆盖率当作一张只有透明度的图。
+fn selection_image(sel: &Selection) -> TileMap {
     let mut image = TileMap::default();
     for tc in tiles_in(sel.bounds()) {
         let Some(s) = sel.tile(tc).filter(|s| s.iter().any(|&v| v != 0)) else { continue };
@@ -260,8 +266,12 @@ pub fn transform_selection(sel: &Selection, m: &Affine, clip: Rect) -> Selection
             px[3] = v.min(ONE as u16);
         }
     }
-    let image = transform_tiles(&image, None, m, Quality::Best, clip);
-    let bounds = content_bounds(&image, clip);
+    image
+}
+
+/// 反过来，把一张图的透明度当作选区。
+fn image_selection(image: &TileMap, clip: Rect) -> Selection {
+    let bounds = content_bounds(image, clip);
     let mut mask = MaskMap::default();
     for tc in tiles_in(bounds) {
         let Some(t) = image.get(tc) else { continue };
@@ -270,6 +280,121 @@ pub fn transform_selection(sel: &Selection, m: &Affine, clip: Rect) -> Selection
         }
     }
     Selection::from_mask(mask, bounds)
+}
+
+/// 不是仿射的映射（实现方案 §3.7）：说出每个目标像素的中心从源图上的哪一点取色。
+/// 透视、网格变形、液化各自实现它（见 `warp`、`liquify`），重采样都在这里。
+pub trait Mapping: Sync {
+    /// 结果可能有内容的范围（画布坐标）。这之外的目标像素不去算。
+    fn reach(&self) -> Rect;
+
+    /// 矩形 `r`（不跨分块）里各像素中心对应的源坐标，逐行写进 `out`：每行 w + 1 个，共 h + 1 行
+    ///（w、h 是 `r` 的宽高）。多出来的一列一行是紧挨着 `r` 右边、下边的像素，用来看相邻像素之间
+    /// 源坐标差多少，也就是这里缩小了多少倍。
+    /// 坐标是连续的画布坐标（像素 (x, y) 占 [x, x+1)）。进来时 `out` 里全是 NaN，没有对应源点的就留着。
+    fn sources(&self, r: Rect, out: &mut [(f64, f64)]);
+}
+
+/// 按一般的映射变换图层像素；选区和画布范围的处理与 `transform_tiles` 相同。
+pub fn map_tiles(src: &TileMap, selection: Option<&Selection>, m: &dyn Mapping, quality: Quality, clip: Rect) -> TileMap {
+    let (floating, rest) = lift(src, selection, clip);
+    let bounds = content_bounds(&floating, clip);
+    let moved = if bounds.is_empty() {
+        TileMap::default()
+    } else {
+        let Some(grid) = Grid::new(&floating, bounds) else { return src.clone() };
+        let dest = m.reach().intersect(clip);
+        build(dest, |tc, scratch| mapped(&grid, bounds, m, quality, tile_rect_in(tc, dest), tc, scratch))
+    };
+    if selection.is_some() {
+        over(rest, moved)
+    } else {
+        moved
+    }
+}
+
+/// 选区跟着一般的映射走，做法同 `transform_selection`。
+pub fn map_selection(sel: &Selection, m: &dyn Mapping, clip: Rect) -> Selection {
+    let image = map_tiles(&selection_image(sel), None, m, Quality::Best, clip);
+    image_selection(&image, clip)
+}
+
+/// 只重算给出的这些分块（液化每动一下只重算笔刷碰到的地方）。整张 `src` 都是源图，不分选区；
+/// `from` 是可能被取到的源范围，范围外当作透明。返回这些分块（画布内的部分）的新内容，全透明的是 None。
+pub fn map_some(src: &TileMap, m: &dyn Mapping, quality: Quality, clip: Rect, tiles: &[TileCoord], from: Rect) -> Vec<(TileCoord, Option<Arc<Tile>>)> {
+    let from = from.intersect(clip);
+    let done = match Grid::new(src, from) {
+        Some(grid) if !from.is_empty() => build_tiles(tiles, |tc, scratch| mapped(&grid, from, m, quality, tile_rect_in(tc, clip), tc, scratch)),
+        _ => TileMap::default(),
+    };
+    tiles.iter().map(|&tc| (tc, done.get(tc).cloned())).collect()
+}
+
+/// 按映射算出目标分块里矩形 `r` 的像素，写进 `scratch`。返回有没有写进看得见的像素。
+/// `bounds` 是源图上有内容的范围（画布坐标）。
+fn mapped(grid: &Grid, bounds: Rect, m: &dyn Mapping, quality: Quality, r: Rect, tc: TileCoord, scratch: &mut [u16]) -> bool {
+    if r.is_empty() {
+        return false;
+    }
+    let w = (r.x1 - r.x0) as usize;
+    let mut at = vec![(f64::NAN, f64::NAN); (w + 1) * ((r.y1 - r.y0) as usize + 1)];
+    m.sources(r, &mut at);
+    let radius = if quality == Quality::Fast { 1.0 } else { 2.0 };
+    // 下面的源坐标以"像素下标"为单位（连续坐标减 0.5），并相对表的左上角。
+    let (lo_x, hi_x) = ((bounds.x0 as i64 - grid.ox) as f64 - radius, (bounds.x1 as i64 - 1 - grid.ox) as f64 + radius);
+    let (lo_y, hi_y) = ((bounds.y0 as i64 - grid.oy) as f64 - radius, (bounds.y1 as i64 - 1 - grid.oy) as f64 + radius);
+    // 四舍五入到 16.16 定点。不用 `round`：没有指定处理器型号时它是一次函数调用，逐像素用太慢。
+    let fixed = |v: f64| floor(v * FIX + 0.5);
+    let mut any = false;
+    for y in r.y0..r.y1 {
+        let j = (y - r.y0) as usize;
+        let row = &mut scratch[row_range(tc, r, y)];
+        for (i, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (u, v) = at[j * (w + 1) + i];
+            if !u.is_finite() || !v.is_finite() {
+                continue;
+            }
+            let x = r.x0 + i as i32;
+            let (sx, sy) = (u - 0.5 - grid.ox as f64, v - 0.5 - grid.oy as f64);
+            let p = if u == x as f64 + 0.5 && v == y as f64 + 0.5 {
+                // 映到自己身上的像素原样照搬（液化里没被碰到的地方），一位不差。
+                grid.px(x as i64 - grid.ox, y as i64 - grid.oy)
+            } else if quality == Quality::Fast {
+                if sx < lo_x || sx > hi_x || sy < lo_y || sy > hi_y {
+                    continue;
+                }
+                grid.bilinear(fixed(sx), fixed(sy))
+            } else {
+                // 相邻像素的源坐标差多少，就是这里的局部缩放；邻居没有源点时退回去看另一边的邻居。
+                let step = |a: (f64, f64), b: Option<(f64, f64)>, c: Option<(f64, f64)>, unit: (f64, f64)| match (b, c) {
+                    (Some(b), _) if b.0.is_finite() && b.1.is_finite() => (b.0 - a.0, b.1 - a.1),
+                    (_, Some(c)) if c.0.is_finite() && c.1.is_finite() => (a.0 - c.0, a.1 - c.1),
+                    _ => unit,
+                };
+                let k = j * (w + 1) + i;
+                let du = step((u, v), at.get(k + 1).copied(), i.checked_sub(1).map(|_| at[k - 1]), (1.0, 0.0));
+                let dv = step((u, v), at.get(k + w + 1).copied(), j.checked_sub(1).map(|_| at[k - w - 1]), (0.0, 1.0));
+                let (nx, ny) = (subsamples(du.0.hypot(du.1)), subsamples(dv.0.hypot(dv.1)));
+                let (hx, hy) = (0.5 * (du.0.abs() + dv.0.abs()), 0.5 * (du.1.abs() + dv.1.abs()));
+                if sx + hx < lo_x || sx - hx > hi_x || sy + hy < lo_y || sy - hy > hi_y {
+                    continue;
+                }
+                let mut acc = [0f32; 4];
+                for b in 0..ny {
+                    for a in 0..nx {
+                        let (s, t) = ((a as f64 + 0.5) / nx as f64 - 0.5, (b as f64 + 0.5) / ny as f64 - 0.5);
+                        grid.bicubic(fixed(sx + s * du.0 + t * dv.0), fixed(sy + s * du.1 + t * dv.1), &mut acc);
+                    }
+                }
+                finish(acc, 1.0 / (nx * ny) as f32)
+            };
+            if p[3] != 0 {
+                *px = p;
+                any = true;
+            }
+        }
+    }
+    any
 }
 
 /// 把要变换的像素"浮"起来，返回（浮起来的那一块，留在原地的部分）。没有选区时整层都浮起来。
@@ -595,6 +720,18 @@ fn fill_row(row: &mut [u16], start: (f64, f64), step: (f64, f64), mut sample: im
     any
 }
 
+/// 向下取整。`f64::floor` 在没有指定处理器型号时是一次函数调用，逐像素用太慢；这里只截掉小数再修正负数。
+/// 只用于取样坐标，调用的地方已经保证它在 i64 的范围里。
+#[inline]
+fn floor(v: f64) -> i64 {
+    let i = v as i64;
+    if (i as f64) > v {
+        i - 1
+    } else {
+        i
+    }
+}
+
 /// 目标分块不少于这么多时，分给几个线程去算。拖手柄时每动一下都要重算一遍预览，大图层上单线程跟不上手。
 const PARALLEL_TILES: usize = 48;
 
@@ -602,7 +739,11 @@ const PARALLEL_TILES: usize = 48;
 /// 返回里面有没有看得见的像素；有才收进结果，所以结果里不会有全透明的分块。
 /// 各分块互不相干，分给几个线程算和一个线程算，结果逐像素相同。
 fn build(dest: Rect, fill: impl Fn(TileCoord, &mut [u16]) -> bool + Sync) -> TileMap {
-    let coords: Vec<TileCoord> = tiles_in(dest).collect();
+    build_tiles(&tiles_in(dest).collect::<Vec<_>>(), fill)
+}
+
+/// 同 `build`，算的是给出的这些分块。
+fn build_tiles(coords: &[TileCoord], fill: impl Fn(TileCoord, &mut [u16]) -> bool + Sync) -> TileMap {
     let work = |part: &[TileCoord]| {
         let mut scratch = vec![0u16; LEN];
         let mut done: Vec<(TileCoord, Arc<Tile>)> = Vec::new();
@@ -622,7 +763,7 @@ fn build(dest: Rect, fill: impl Fn(TileCoord, &mut [u16]) -> bool + Sync) -> Til
             jobs.into_iter().map(|j| j.join().unwrap()).collect()
         })
     } else {
-        vec![work(&coords)]
+        vec![work(coords)]
     };
     let mut out = TileMap::default();
     for (tc, tile) in parts.into_iter().flatten() {

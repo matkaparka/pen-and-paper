@@ -4,7 +4,7 @@
 //! 键位存在设置文件里，一行一个：`key.undo = Ctrl+Z`，等号后面空着表示这个功能不绑键。
 
 use crate::settings::Settings;
-use crate::{Cmd, Tool};
+use crate::{Cmd, FilterKind, Tool};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Key {
@@ -122,6 +122,7 @@ pub const ACTIONS: &[Action] = &[
     action("lasso", "套索", "Lasso", Cmd::SelectTool(Tool::Lasso), "L"),
     action("wand", "魔棒", "Magic Wand", Cmd::SelectTool(Tool::Wand), "W"),
     action("move", "移动", "Move", Cmd::SelectTool(Tool::Move), "V"),
+    action("liquify", "液化", "Liquify", Cmd::SelectTool(Tool::Liquify), "R"),
     action("size_down", "笔刷小一档", "Smaller Brush", Cmd::SizeDown, "["),
     action("size_up", "笔刷大一档", "Bigger Brush", Cmd::SizeUp, "]"),
     action("stabilizer_down", "稳定器低一档", "Less Stabilizing", Cmd::StabilizerDown, "F2"),
@@ -133,6 +134,9 @@ pub const ACTIONS: &[Action] = &[
     action("clear", "清除", "Clear", Cmd::ClearLayer, "Delete"),
     action("fill", "填充前景色", "Fill with Foreground Color", Cmd::FillLayer, ""),
     action("transform", "自由变换", "Free Transform", Cmd::Transform, "Ctrl+T"),
+    action("hue_sat", "色相/饱和度", "Hue/Saturation", Cmd::Filter(FilterKind::HueSat), "Ctrl+U"),
+    action("bright_contrast", "亮度/对比度", "Brightness/Contrast", Cmd::Filter(FilterKind::BrightContrast), ""),
+    action("blur", "模糊", "Blur", Cmd::Filter(FilterKind::Blur), ""),
     action("select_all", "全选", "Select All", Cmd::SelectAll, "Ctrl+A"),
     action("deselect", "取消选择", "Deselect", Cmd::Deselect, "Ctrl+D"),
     action("invert_selection", "反选", "Invert Selection", Cmd::InvertSelection, "Ctrl+Shift+I"),

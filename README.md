@@ -18,7 +18,9 @@
 - **稳定器** 0 到 15 档，抬笔时线一定画到抬笔的位置。
 - **笔刷**：笔、马克笔（叠涂不会越叠越深）、喷枪、橡皮，共用一套参数（大小、最小大小、浓度、最小浓度、边缘硬度），压力控制粗细或浓淡。
 - **选区与填充**：选框、套索、魔棒；油漆桶带"缝隙闭合"，线稿留着小缺口也不漏色。
-- **移动与自由变换**：手柄在画布上，确定和取消在面板里，全程没有对话框。
+- **移动与自由变换**：手柄在画布上，确定和取消在面板里，全程没有对话框。除了缩放、旋转，还能扭曲（四个角各自拖，做透视）、斜切和网格变形（拖网格上的点把画面弯过去）。
+- **液化**：推、顺时针转、逆时针转、收缩、膨胀、复原；确定之前每一笔都能撤销，画多少笔都不会越画越糊。
+- **滤镜**：只有三个，色相/饱和度、亮度/对比度、模糊，拖滑块时画布实时变化，不弹对话框。
 - **图层**：8 种混合模式、不透明度、保护不透明度、锁定、剪贴、向下合并、合并可见图层、拼合、白底变透明。
 - **视图**：以光标为中心缩放、旋转、镜像，按住空格平移。
 - **文件**：自己的格式 `.zhibi`（压缩包里是 JSON 和逐层 PNG，每通道 15 位精度）；PSD、ORA 的打开和导出；导出 PNG。
@@ -26,7 +28,7 @@
 
 ### 系统要求与安装
 
-Windows 10 或 11，64 位。目前没有安装包，需要自己编译：
+Windows 10 或 11，64 位。编译好的程序在 [Releases](https://github.com/matkaparka/pen-and-paper/releases) 页面，下载 zip 解压即可用（程序没有数字签名，第一次运行时 Windows 可能提示"已保护你的电脑"，点"更多信息"→"仍要运行"）。也可以自己编译：
 
 1. 安装 [Rust](https://www.rust-lang.org/)（稳定版，Windows 默认的 MSVC 工具链）。
 2. 在 `src` 目录下运行 `cargo build --release`。
@@ -40,13 +42,15 @@ Windows 10 或 11，64 位。目前没有安装包，需要自己编译：
 |------|------|
 | B / N / A / E | 笔 / 马克笔 / 喷枪 / 橡皮 |
 | G / M / L / W / V | 油漆桶 / 选框 / 套索 / 魔棒 / 移动 |
+| R | 液化 |
 | `[` `]` | 笔刷小一档 / 大一档 |
 | 1 … 9、0 | 浓度 10% … 90%、100% |
 | X | 交换前景色和背景色 |
 | 空格拖动 / Alt+空格拖动 / Alt 点击 | 平移 / 旋转视图 / 吸管 |
 | PageUp / PageDown / Home | 放大 / 缩小 / 回到全图 |
 | H | 镜像查看 |
-| Ctrl+T | 自由变换 |
+| Ctrl+T | 自由变换（按住 Ctrl 拖角、拖边：扭曲、斜切） |
+| Ctrl+U | 色相/饱和度 |
 | Ctrl+Z / Ctrl+Y | 撤销 / 重做 |
 | Tab | 隐藏或显示面板 |
 
@@ -73,7 +77,9 @@ Pen & Paper does one thing: drawing and painting — sketching, inking and colou
 - **Stabilizer** with 16 levels (0–15); a stroke always ends exactly where the pen was lifted.
 - **Brushes**: pen, marker (overlapping strokes don't get darker), airbrush, eraser — one set of parameters (size, min size, density, min density, hardness); pressure controls width or density.
 - **Selection and fill**: rectangle, lasso, magic wand; the paint bucket has *gap closing*, so line art with small gaps doesn't leak.
-- **Move and free transform** with on-canvas handles and OK/Cancel in the panel — no dialogs.
+- **Move and free transform** with on-canvas handles and OK/Cancel in the panel — no dialogs. Besides scaling and rotating: distort (drag each corner on its own, for perspective), skew, and mesh warp (drag points on a grid to bend the picture).
+- **Liquify**: push, twirl clockwise or counter-clockwise, pinch, bloat, restore. Every stroke can be undone until you apply, and the picture never gets blurrier however many strokes you make.
+- **Filters**: just three — hue/saturation, brightness/contrast, blur — with the canvas updating as you drag the sliders, no dialogs.
 - **Layers**: 8 blend modes, opacity, protect opacity, lock, clipping, merge down, merge visible, flatten, white to transparent.
 - **View**: zoom at the cursor, rotate, mirror, hold Space to pan.
 - **Files**: own format `.zhibi` (a ZIP with JSON and one PNG per layer, 15 bits per channel); open and export PSD and ORA; export PNG.
@@ -81,7 +87,7 @@ Pen & Paper does one thing: drawing and painting — sketching, inking and colou
 
 ### Requirements and building
 
-Windows 10 or 11, 64-bit. There is no installer yet; build it yourself:
+Windows 10 or 11, 64-bit. A ready-built program is on the [Releases](https://github.com/matkaparka/pen-and-paper/releases) page: download the zip and unpack it (the program is not signed, so Windows may say it protected your PC the first time — choose *More info* → *Run anyway*). Or build it yourself:
 
 1. Install [Rust](https://www.rust-lang.org/) (stable, the default MSVC toolchain on Windows).
 2. Run `cargo build --release` in the `src` folder.
@@ -95,13 +101,15 @@ Settings live in `%APPDATA%\Zhibi\settings.txt`; delete it to go back to the def
 |-----|--------|
 | B / N / A / E | Pen / Marker / Airbrush / Eraser |
 | G / M / L / W / V | Bucket / Rectangle select / Lasso / Magic wand / Move |
+| R | Liquify |
 | `[` `]` | Smaller / bigger brush |
 | 1 … 9, 0 | Density 10 % … 90 %, 100 % |
 | X | Swap foreground and background colour |
 | Space-drag / Alt+Space-drag / Alt-click | Pan / rotate view / pick colour |
 | PageUp / PageDown / Home | Zoom in / zoom out / reset view |
 | H | Mirror view |
-| Ctrl+T | Free transform |
+| Ctrl+T | Free transform (Ctrl-drag a corner or edge: distort, skew) |
+| Ctrl+U | Hue/Saturation |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Tab | Show or hide panels |
 
