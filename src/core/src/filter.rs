@@ -139,11 +139,12 @@ impl Ctx<'_> {
         self.selection.map_or(self.clip, |s| s.bounds().intersect(self.clip))
     }
 
-    /// 把算好的分块收起来。有选区时从原图出发（没算的分块一点没选中，原样留着），否则从空白出发。
+    /// 把算好的分块收起来。从原图出发：没算的分块（选区一点没碰到的、画布外的）原样留着；
+    /// 算了的分块伸出画布的那部分也换回原来的像素（实现方案 §3.15）。
     fn assemble(&self, done: impl IntoIterator<Item = (TileCoord, Option<Arc<Tile>>)>) -> TileMap {
-        let mut out = if self.selection.is_some() { self.src.clone() } else { TileMap::default() };
+        let mut out = self.src.clone();
         for (tc, t) in done {
-            out.replace(tc, t);
+            out.replace(tc, crate::transform::keep_outside(t, self.src.get(tc), tc, self.clip));
         }
         out
     }
@@ -1069,16 +1070,17 @@ mod tests {
         assert!(at(&out, 100, 75)[3].abs_diff(edge) <= 1 && at(&out, 119, 75)[3].abs_diff(edge) <= 1);
         assert!(at(&out, 20, 75)[3] > 0 && at(&out, 99, 75)[3] > 0);
 
-        // 画布外面的内容不算数，结果里画布外面什么都没有。
+        // 画布外面的内容不参与，原样留着（实现方案 §3.15）。
         let spill = noise_in(rect(150, 100, 300, 260));
         for adjust in [Adjust::Blur { radius: 8.0 }, Adjust::HueSat { hue: 40.0, saturation: 0.0, lightness: 0.0 }] {
             let out = apply(&spill, None, &adjust, false, clip);
-            assert_tidy(&out, clip);
-            assert!(!out.is_empty());
+            let inside = |x: i32, y: i32| x < clip.x1 && y < clip.y1;
+            assert!(pixels_in(rect(150, 100, 300, 260)).filter(|&(x, y)| !inside(x, y)).all(|(x, y)| at(&out, x, y) == at(&spill, x, y)));
+            assert!(pixels_in(rect(150, 100, 200, 150)).any(|(x, y)| at(&out, x, y) != at(&spill, x, y)), "画布里的应当变了");
         }
         let mut outside = TileMap::default();
         paint(&mut outside, rect(200, 0, 300, 150), |_, _| [FULL; 4]);
-        assert!(apply(&outside, None, &Adjust::Blur { radius: 30.0 }, false, clip).is_empty());
+        assert!(shared(&apply(&outside, None, &Adjust::Blur { radius: 30.0 }, false, clip), &outside));
         // 有选区时画布外面的像素不算选中，原样留着。
         let kept = apply(&spill, Some(&Selection::rect(rect(0, 0, 400, 400))), &Adjust::Blur { radius: 8.0 }, false, clip);
         assert!(pixels_in(rect(200, 100, 300, 260)).all(|(x, y)| at(&kept, x, y) == at(&spill, x, y)));
@@ -1136,10 +1138,10 @@ mod tests {
             &apply(&src, None, &Adjust::Blur { radius: 250.0 }, false, clip),
             &apply(&src, None, &Adjust::Blur { radius: 100.0 }, false, clip)
         ));
-        // clip 是空的、或者和内容不沾边；图层是空的。
+        // clip 是空的、或者和内容不沾边：什么都不改；图层是空的。
         for c in [Rect::EMPTY, rect(500, 500, 600, 600), rect(10, 10, 5, 5)] {
-            assert!(apply(&src, None, &Adjust::Blur { radius: 5.0 }, false, c).is_empty());
-            assert!(apply(&src, None, &Adjust::HueSat { hue: 30.0, saturation: 0.0, lightness: 0.0 }, false, c).is_empty());
+            assert!(shared(&apply(&src, None, &Adjust::Blur { radius: 5.0 }, false, c), &src));
+            assert!(shared(&apply(&src, None, &Adjust::HueSat { hue: 30.0, saturation: 0.0, lightness: 0.0 }, false, c), &src));
             assert!(shared(&apply(&src, Some(&sel), &Adjust::Blur { radius: 5.0 }, false, c), &src));
         }
         assert!(apply(&TileMap::default(), None, &Adjust::Blur { radius: 10.0 }, false, clip).is_empty());

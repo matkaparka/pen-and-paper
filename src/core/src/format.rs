@@ -6,7 +6,16 @@
 //!   背景色 `background`、当前图层的序号 `active`，以及自下而上的图层列表 `layers`。每个图层有
 //!   `name`、`opacity`（0 到 1）、`visible`、`blend`、图像在画布上占的矩形 `x` `y` `width` `height`
 //!   和图像的文件名 `file`；空图层的 `file` 是 `null`，矩形大小为零。
+//!   版本 2 起（0.3）每个图层还有：`kind`（`"pixels"`、`"folder"`、`"fill"`）、嵌套深度 `depth`
+//!   （0 是最外层；文件夹里面的东西是紧挨在它下面、深度比它大的那一串）、`pass_through`；
+//!   文件夹有 `open`；填充图层有 `fill`（`{"type": "solid", "color": "#RRGGBB"}`，或者本程序还不会画的
+//!   `{"type": "other"}`），从 PSD 读来的填充图层另有 `psd`（原始描述符块的 `key` 和 Base64 的 `data`）；
+//!   有蒙版的有 `mask`：`x` `y` `width` `height` `file`（同上）、矩形以外的值 `default`（`"white"` 或
+//!   `"black"`）和 `disabled`。有图层样式的有 `style`：PS 原来的块 `psd`（`key` 和 Base64 的 `data` 的列表）、
+//!   `enabled`、文件的全局光 `light`（角度、高度，没有就是 `null`）；读的时候照 PSD 的样子重新解析。
+//!   图层、蒙版的矩形可以伸出画布（不超过画布四周各一个画布的宽和高）。
 //! - `layers/NNNN.png`：一个图层的像素，16 位 RGBA、非预乘透明度（PNG 的规定），只含有内容的那块矩形。
+//! - `masks/NNNN.png`：一个图层的蒙版，16 位灰度。
 //! - `merged.png`：合成好的整张画布，8 位 RGB，给别的程序预览用。
 //! - `thumbnail.png`：同上，缩小到长边不超过 256 像素。
 //!
@@ -23,9 +32,9 @@ use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::document::{BlendMode, Document, Layer, LayerProps, MAX_SIDE};
+use crate::document::{BlendMode, Document, Fill, Kind, Layer, LayerProps, Mask, Paint, MAX_SIDE, Style};
 use crate::lang::tr;
-use crate::tile::{Tile, TileMap, TILE};
+use crate::tile::{GrayMap, Tile, TileMap, TILE};
 use crate::trf;
 use crate::{Rect, ONE};
 
@@ -35,7 +44,7 @@ pub const EXTENSION: &str = "zhibi";
 /// `document.json` 里 `format` 字段的值。
 const FORMAT: &str = "zhibi";
 /// 写出的格式版本，也是能读的最高版本。
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 const DOCUMENT_JSON: &str = "document.json";
 const MERGED_PNG: &str = "merged.png";
 const THUMBNAIL_PNG: &str = "thumbnail.png";
@@ -127,16 +136,19 @@ fn create_temp(path: &Path) -> io::Result<(PathBuf, File)> {
 
 /// 把整个压缩包写进 `file` 并落盘。`file` 在返回时关闭，之后才能改名或删除。
 fn write_archive(doc: &Document, file: File) -> io::Result<()> {
-    let canvas = doc.bounds();
-    let rects: Vec<Rect> = doc.layers().iter().map(|l| content_bounds(&l.tiles, canvas)).collect();
+    // 伸出画布的内容照存（实现方案 §3.15）。
+    let keep = doc.keep_bounds();
+    let rects: Vec<Rect> = doc.layers().iter().map(|l| content_bounds(&l.tiles, keep)).collect();
     let names: Vec<Option<String>> =
         rects.iter().enumerate().map(|(i, r)| (!r.is_empty()).then(|| format!("layers/{i:04}.png"))).collect();
+    let mask_rects: Vec<Rect> = doc.layers().iter().map(|l| l.mask.as_ref().map_or(Rect::EMPTY, |m| mask_bounds(&m.tiles, keep))).collect();
     let layers: Vec<Value> = doc
         .layers()
         .iter()
+        .enumerate()
         .zip(rects.iter().zip(&names))
-        .map(|(layer, (r, name))| {
-            json!({
+        .map(|((i, layer), (r, name))| {
+            let mut v = json!({
                 "name": layer.props.name,
                 "opacity": opacity_number(layer.props.opacity),
                 "visible": layer.props.visible,
@@ -144,12 +156,48 @@ fn write_archive(doc: &Document, file: File) -> io::Result<()> {
                 "lock_alpha": layer.props.lock_alpha,
                 "locked": layer.props.locked,
                 "clip": layer.props.clip,
+                "pass_through": layer.props.pass_through,
+                "depth": layer.depth,
                 "x": r.x0,
                 "y": r.y0,
                 "width": r.x1 - r.x0,
                 "height": r.y1 - r.y0,
                 "file": name,
-            })
+            });
+            match &layer.kind {
+                Kind::Pixels => v["kind"] = json!("pixels"),
+                Kind::Folder { open } => {
+                    v["kind"] = json!("folder");
+                    v["open"] = json!(open);
+                }
+                Kind::Fill(fill) => {
+                    v["kind"] = json!("fill");
+                    v["fill"] = match fill.paint {
+                        Paint::Solid(c) => json!({ "type": "solid", "color": format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]) }),
+                        Paint::Other => json!({ "type": "other" }),
+                    };
+                    if let Some((key, data)) = &fill.psd {
+                        v["psd"] = json!({ "key": String::from_utf8_lossy(key), "data": base64(data) });
+                    }
+                }
+            }
+            if let Some(st) = &layer.style {
+                let blocks: Vec<Value> = st.psd.iter().map(|(k, d)| json!({ "key": String::from_utf8_lossy(k), "data": base64(d) })).collect();
+                v["style"] = json!({ "psd": blocks, "enabled": st.enabled, "light": st.light.map(|(a, h)| [a, h]) });
+            }
+            if let Some(m) = &layer.mask {
+                let r = mask_rects[i];
+                v["mask"] = json!({
+                    "x": r.x0,
+                    "y": r.y0,
+                    "width": r.x1 - r.x0,
+                    "height": r.y1 - r.y0,
+                    "file": (!r.is_empty()).then(|| format!("masks/{i:04}.png")),
+                    "default": if m.default as u32 >= ONE / 2 { "white" } else { "black" },
+                    "disabled": m.disabled,
+                });
+            }
+            v
         })
         .collect();
     let meta = json!({
@@ -179,6 +227,11 @@ fn write_archive(doc: &Document, file: File) -> io::Result<()> {
             add(name, &encode_layer(&layer.tiles, *r)?)?;
         }
     }
+    for (i, (layer, r)) in doc.layers().iter().zip(&mask_rects).enumerate() {
+        if let (Some(m), false) = (&layer.mask, r.is_empty()) {
+            add(&format!("masks/{i:04}.png"), &encode_mask(m, *r)?)?;
+        }
+    }
     let (w, h) = (doc.width as usize, doc.height as usize);
     let rgb = doc.flatten_rgb();
     add(MERGED_PNG, &encode_rgb8(w, h, &rgb)?)?;
@@ -201,18 +254,22 @@ fn opacity_number(v: f32) -> f64 {
     }
 }
 
-/// 图层在画布之内、不是全透明的像素的包围盒；没有这样的像素就是空矩形。
-fn content_bounds(tiles: &TileMap, canvas: Rect) -> Rect {
-    let (tx_max, ty_max) = ((canvas.x1 - 1) / TILE, (canvas.y1 - 1) / TILE);
+/// 图层在矩形 `area`（图层能放到的范围）之内、不是全透明的像素的包围盒；没有这样的像素就是空矩形。
+fn content_bounds(tiles: &TileMap, area: Rect) -> Rect {
+    if area.is_empty() {
+        return Rect::EMPTY;
+    }
+    let (tx0, ty0) = (area.x0.div_euclid(TILE), area.y0.div_euclid(TILE));
+    let (tx1, ty1) = ((area.x1 - 1).div_euclid(TILE), (area.y1 - 1).div_euclid(TILE));
     let mut bounds = Rect::EMPTY;
     for (tx, ty) in tiles.coords() {
-        // 先筛掉画布外的分块，下面乘 TILE 才不会溢出。
-        if tx < 0 || ty < 0 || tx > tx_max || ty > ty_max {
+        // 先筛掉范围外的分块，下面乘 TILE 才不会溢出。
+        if tx < tx0 || ty < ty0 || tx > tx1 || ty > ty1 {
             continue;
         }
         let Some(tile) = tiles.get((tx, ty)) else { continue };
         let (ox, oy) = (tx * TILE, ty * TILE);
-        let clip = Rect { x0: ox, y0: oy, x1: ox + TILE, y1: oy + TILE }.intersect(canvas);
+        let clip = Rect { x0: ox, y0: oy, x1: ox + TILE, y1: oy + TILE }.intersect(area);
         // 已经整个落在包围盒里的分块不会再把它撑大，不用逐像素看。
         if bounds.union(clip) == bounds {
             continue;
@@ -227,7 +284,7 @@ fn content_bounds(tiles: &TileMap, canvas: Rect) -> Rect {
     bounds
 }
 
-/// 把图层在矩形 `r`（非空，在画布之内）里的像素编码成 16 位 RGBA 的 PNG。
+/// 把图层在矩形 `r`（非空，可以伸出画布）里的像素编码成 16 位 RGBA 的 PNG。
 /// 一行一行地换算和压缩，不用整幅的 16 位缓冲区。
 fn encode_layer(tiles: &TileMap, r: Rect) -> io::Result<Vec<u8>> {
     let width = (r.x1 - r.x0) as usize;
@@ -240,13 +297,13 @@ fn encode_layer(tiles: &TileMap, r: Rect) -> io::Result<Vec<u8>> {
     let mut writer = enc.write_header()?;
     let mut stream = writer.stream_writer()?;
 
-    let (tx0, tx1) = (r.x0 / TILE, (r.x1 - 1) / TILE);
+    let (tx0, tx1) = (r.x0.div_euclid(TILE), (r.x1 - 1).div_euclid(TILE));
     let mut row = vec![0u8; width * 8];
     // 当前这一排分块；同一排的 64 行共用，不必每行都去查表。
     let mut strip: Vec<Option<&Tile>> = Vec::new();
     for y in r.y0..r.y1 {
-        let ty = y / TILE;
-        if y == r.y0 || y % TILE == 0 {
+        let ty = y.div_euclid(TILE);
+        if y == r.y0 || y.rem_euclid(TILE) == 0 {
             strip.clear();
             strip.extend((tx0..=tx1).map(|tx| tiles.get((tx, ty)).map(|t| t.as_ref())));
         }
@@ -269,6 +326,66 @@ fn encode_layer(tiles: &TileMap, r: Rect) -> io::Result<Vec<u8>> {
     stream.finish()?;
     writer.finish()?;
     Ok(out)
+}
+
+/// 蒙版里存着分块的范围（对齐到分块，裁到图层能放到的范围里）；范围外都是默认值。
+fn mask_bounds(tiles: &GrayMap, keep: Rect) -> Rect {
+    tiles.coords().fold(Rect::EMPTY, |r, (tx, ty)| r.union(Rect { x0: tx * TILE, y0: ty * TILE, x1: (tx + 1) * TILE, y1: (ty + 1) * TILE }.intersect(keep)))
+}
+
+/// 把蒙版在矩形 `r`（非空）里的值编码成 16 位灰度的 PNG。15 位换到 16 位四舍五入，来回一趟一位不差。
+fn encode_mask(mask: &Mask, r: Rect) -> io::Result<Vec<u8>> {
+    let width = (r.x1 - r.x0) as usize;
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, width as u32, (r.y1 - r.y0) as u32);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Sixteen);
+    enc.set_compression(png::Compression::Fast);
+    let mut writer = enc.write_header()?;
+    let mut stream = writer.stream_writer()?;
+    let mut row = vec![0u8; width * 2];
+    for y in r.y0..r.y1 {
+        for (k, x) in (r.x0..r.x1).enumerate() {
+            let (tx, ty) = (x.div_euclid(TILE), y.div_euclid(TILE));
+            let v = mask.tiles.get((tx, ty)).map_or(mask.default, |t| t[((y - ty * TILE) * TILE + (x - tx * TILE)) as usize]);
+            let v16 = div_round((v as u64).min(ONE64) * MAX16, ONE64) as u16;
+            row[k * 2..k * 2 + 2].copy_from_slice(&v16.to_be_bytes());
+        }
+        stream.write_all(&row)?;
+    }
+    stream.finish()?;
+    writer.finish()?;
+    Ok(out)
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// 标准的 Base64（带补齐的等号）。只用来存从 PSD 读来的那一小段原始数据，不值得为它加一个依赖。
+fn base64(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (k, &b)| n | (b as u32) << (16 - 8 * k));
+        for k in 0..4 {
+            out.push(if k <= chunk.len() { BASE64[(n >> (18 - 6 * k) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// `base64` 反过来。不是合法的 Base64 时返回 None。
+fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim_end_matches('=');
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut n, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        n = n << 6 | BASE64.iter().position(|&b| b == c)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((n >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// 8 位 RGB 的 PNG（合成图和缩略图）。
@@ -329,6 +446,17 @@ struct LayerEntry {
     /// 图像在画布上占的矩形，保证不出画布
     rect: Rect,
     file: Option<String>,
+    kind: Kind,
+    depth: u16,
+    mask: Option<MaskEntry>,
+    style: Option<Style>,
+}
+
+struct MaskEntry {
+    rect: Rect,
+    file: Option<String>,
+    default: u16,
+    disabled: bool,
 }
 
 /// 文件内容有问题时的错误。
@@ -349,13 +477,26 @@ pub fn load(path: &Path) -> io::Result<Document> {
     let mut layers = Vec::with_capacity(header.layers.len());
     for (i, entry) in header.layers.into_iter().enumerate() {
         let mut tiles = TileMap::default();
+        let n = i + 1;
         if let Some(name) = &entry.file {
-            let n = i + 1;
             read_layer_png(&mut zip, name, entry.rect, &mut tiles).map_err(|e| {
                 io::Error::new(e.kind(), trf!("第 {n} 个图层的图像 {name:.80}：{e}", "Image {name:.80} of layer {n}: {e}"))
             })?;
         }
-        layers.push(Layer { props: entry.props, tiles });
+        let mut layer = Layer::pixels(entry.props, tiles);
+        layer.kind = entry.kind;
+        layer.depth = entry.depth;
+        layer.style = entry.style;
+        if let Some(m) = entry.mask {
+            let mut mask = Mask { tiles: GrayMap::default(), default: m.default, disabled: m.disabled };
+            if let Some(name) = &m.file {
+                read_mask_png(&mut zip, name, m.rect, &mut mask).map_err(|e| {
+                    io::Error::new(e.kind(), trf!("第 {n} 个图层的蒙版 {name:.80}：{e}", "Mask {name:.80} of layer {n}: {e}"))
+                })?;
+            }
+            layer.mask = Some(mask);
+        }
+        layers.push(layer);
     }
     let mut doc = Document::from_layers(header.width, header.height, header.background, layers);
     if let Some(dpi) = header.dpi {
@@ -450,14 +591,15 @@ fn parse_header(root: &Value) -> io::Result<Header> {
             ))
         })?;
 
-    let canvas = Rect { x0: 0, y0: 0, x1: width, y1: height };
+    // 图层、蒙版的图像可以伸出画布，但不超过图层能放到的范围（实现方案 §3.15）。
+    let keep = Document::keep_area(width, height);
     let layers = root
         .get("layers")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid(tr("document.json 里没有图层列表 layers", "document.json has no layer list (layers)")))?
         .iter()
         .enumerate()
-        .map(|(i, v)| parse_layer(v, i, canvas))
+        .map(|(i, v)| parse_layer(v, i, keep))
         .collect::<io::Result<Vec<_>>>()?;
 
     Ok(Header {
@@ -470,7 +612,7 @@ fn parse_header(root: &Value) -> io::Result<Header> {
     })
 }
 
-fn parse_layer(v: &Value, index: usize, canvas: Rect) -> io::Result<LayerEntry> {
+fn parse_layer(v: &Value, index: usize, keep: Rect) -> io::Result<LayerEntry> {
     // 中文是"第 N 个图层"后面直接接上 `what`，英文是 "Layer N" 加空格再接。
     let n = index + 1;
     let bad = |what: &str| invalid(trf!("第 {n} 个图层{what}", "Layer {n} {what}"));
@@ -489,31 +631,46 @@ fn parse_layer(v: &Value, index: usize, canvas: Rect) -> io::Result<LayerEntry> 
         bad(&trf!("的混合模式无法识别：{blend_id:.40}", "has an unknown blend mode: {blend_id:.40}"))
     })?;
 
-    let int = |key: &str| v.get(key).and_then(Value::as_i64);
-    let (Some(x), Some(y), Some(w), Some(h)) = (int("x"), int("y"), int("width"), int("height")) else {
-        return Err(bad(tr(
-            "的矩形 x、y、width、height 缺失或不是整数",
-            "has a missing or non-integer x, y, width or height",
-        )));
-    };
-    let (cw, ch) = (canvas.x1 as i64, canvas.y1 as i64);
-    // 先确认 x、y 在画布里再做减法，文件里写个天文数字也不会溢出。
-    if !(0..=cw).contains(&x) || !(0..=ch).contains(&y) || !(0..=cw - x).contains(&w) || !(0..=ch - y).contains(&h) {
-        return Err(bad(&trf!(
-            "的矩形（x {x}、y {y}、宽 {w}、高 {h}）超出了画布",
-            "has a rectangle (x {x}, y {y}, width {w}, height {h}) outside the canvas"
-        )));
-    }
-    let file = match v.get("file") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(_) => return Err(bad(tr("的 file 应为文件名或 null", "has a file value that is not a file name or null"))),
-    };
-    if file.is_some() && (w == 0 || h == 0) {
-        return Err(bad(tr("指定了图像，矩形却是空的", "names an image but its rectangle is empty")));
-    }
+    let (rect, file) = image_ref(v, keep).map_err(|what| bad(&what))?;
 
-    // 这三个是后来加的，旧文件里没有，缺了就当没开。
+    // 版本 2 加的：种类、深度、文件夹、填充、蒙版。版本 1 的文件里没有，都是最外层的像素图层。
+    let kind = match v.get("kind").and_then(Value::as_str) {
+        None | Some("pixels") => Kind::Pixels,
+        Some("folder") => Kind::Folder { open: v.get("open").and_then(Value::as_bool).unwrap_or(true) },
+        Some("fill") => {
+            let fill = v.get("fill").ok_or_else(|| bad(tr("是填充图层，却没有 fill", "is a fill layer without fill")))?;
+            let paint = match fill.get("type").and_then(Value::as_str) {
+                Some("solid") => {
+                    let color = fill.get("color").and_then(Value::as_str).and_then(parse_color).ok_or_else(|| {
+                        bad(tr("的填充颜色应为 #RRGGBB", "has a fill color that is not #RRGGBB"))
+                    })?;
+                    Paint::Solid(color)
+                }
+                Some("other") => Paint::Other,
+                _ => return Err(bad(tr("的填充种类无法识别", "has an unknown fill type"))),
+            };
+            let psd = v.get("psd").and_then(|p| {
+                let key: [u8; 4] = p.get("key")?.as_str()?.as_bytes().try_into().ok()?;
+                Some((key, unbase64(p.get("data")?.as_str()?)?))
+            });
+            Kind::Fill(Fill { paint, psd })
+        }
+        Some(other) => return Err(bad(&trf!("的种类无法识别：{other:.40}", "has an unknown kind: {other:.40}"))),
+    };
+    let depth = v.get("depth").and_then(Value::as_u64).map_or(0, |d| d.min(u16::MAX as u64) as u16);
+    let mask = match v.get("mask") {
+        None | Some(Value::Null) => None,
+        Some(m) => {
+            let (rect, file) = image_ref(m, keep).map_err(|what| bad(&trf!("的蒙版{what}", "mask {what}")))?;
+            let default = match m.get("default").and_then(Value::as_str) {
+                Some("black") => 0,
+                _ => ONE as u16,
+            };
+            Some(MaskEntry { rect, file, default, disabled: m.get("disabled").and_then(Value::as_bool).unwrap_or(false) })
+        }
+    };
+
+    // 这几个是后来加的，旧文件里没有，缺了就当没开。
     let flag = |key: &str| v.get(key).and_then(Value::as_bool).unwrap_or(false);
     let props = LayerProps {
         name: name.into(),
@@ -523,12 +680,96 @@ fn parse_layer(v: &Value, index: usize, canvas: Rect) -> io::Result<LayerEntry> 
         lock_alpha: flag("lock_alpha"),
         locked: flag("locked"),
         clip: flag("clip"),
+        pass_through: flag("pass_through"),
     };
-    Ok(LayerEntry {
-        props,
-        rect: Rect { x0: x as i32, y0: y as i32, x1: (x + w) as i32, y1: (y + h) as i32 },
-        file,
-    })
+    // 图层样式：原始的块照 PSD 的样子重新解析；读不懂的块照样留着。
+    let style = v.get("style").filter(|s| !s.is_null()).map(|s| {
+        let blocks: Vec<([u8; 4], Vec<u8>)> = s
+            .get("psd")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|b| Some((b.get("key")?.as_str()?.as_bytes().try_into().ok()?, unbase64(b.get("data")?.as_str()?)?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let light = s.get("light").and_then(Value::as_array).and_then(|a| Some((a.first()?.as_i64()? as i32, a.get(1)?.as_i64()? as i32)));
+        let refs: Vec<([u8; 4], &[u8])> = blocks.iter().map(|(k, d)| (*k, d.as_slice())).collect();
+        let (mut style, _) = crate::psd::parse_style(&refs, light);
+        style.enabled = s.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        style
+    });
+    Ok(LayerEntry { props, rect, file, kind, depth, mask, style })
+}
+
+/// `#RRGGBB` 写的颜色。
+fn parse_color(text: &str) -> Option<[u8; 3]> {
+    let hex = text.strip_prefix('#').filter(|h| h.len() == 6)?;
+    let v = u32::from_str_radix(hex, 16).ok()?;
+    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+}
+
+/// 图层或蒙版的图像在画布上占的矩形和图像文件名（没有图像时是 None）。矩形要在 `keep`（图层能放到的范围）里。
+/// 有问题时返回说明。
+fn image_ref(v: &Value, keep: Rect) -> Result<(Rect, Option<String>), String> {
+    let int = |key: &str| v.get(key).and_then(Value::as_i64);
+    let (Some(x), Some(y), Some(w), Some(h)) = (int("x"), int("y"), int("width"), int("height")) else {
+        return Err(tr("的矩形 x、y、width、height 缺失或不是整数", "has a missing or non-integer x, y, width or height").into());
+    };
+    let (kx0, ky0, kx1, ky1) = (keep.x0 as i64, keep.y0 as i64, keep.x1 as i64, keep.y1 as i64);
+    // 先确认 x、y 在范围里再做减法，文件里写个天文数字也不会溢出。
+    if !(kx0..=kx1).contains(&x) || !(ky0..=ky1).contains(&y) || !(0..=kx1 - x).contains(&w) || !(0..=ky1 - y).contains(&h) {
+        return Err(trf!(
+            "的矩形（x {x}、y {y}、宽 {w}、高 {h}）离画布太远",
+            "has a rectangle (x {x}, y {y}, width {w}, height {h}) too far outside the canvas"
+        ));
+    }
+    let file = match v.get("file") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(tr("的 file 应为文件名或 null", "has a file value that is not a file name or null").into()),
+    };
+    if file.is_some() && (w == 0 || h == 0) {
+        return Err(tr("指定了图像，矩形却是空的", "names an image but its rectangle is empty").into());
+    }
+    Ok((Rect { x0: x as i32, y0: y as i32, x1: (x + w) as i32, y1: (y + h) as i32 }, file))
+}
+
+/// 把压缩包里的一张蒙版图像（16 位灰度）解码进蒙版。`rect` 非空且在画布之内。
+fn read_mask_png<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str, rect: Rect, mask: &mut Mask) -> io::Result<()> {
+    let (w, h) = ((rect.x1 - rect.x0) as u32, (rect.y1 - rect.y0) as u32);
+    let entry = match zip.by_name(name) {
+        Ok(entry) => entry,
+        Err(ZipError::FileNotFound) => return Err(invalid(tr("不在压缩包里", "not in the archive"))),
+        Err(e) => return Err(invalid(trf!("无法读取：{e}", "could not read: {e}"))),
+    };
+    let limit = 2 * 2 * w as u64 * h as u64 + (16 << 20);
+    let mut decoder = png::Decoder::new(entry.take(limit));
+    decoder.set_transformations(png::Transformations::IDENTITY);
+    let decode_error = |e: png::DecodingError| invalid(trf!("无法解码：{e}", "could not decode: {e}"));
+    let info = decoder.read_header_info().map_err(decode_error)?;
+    if (info.width, info.height) != (w, h) {
+        return Err(invalid(tr("尺寸与 document.json 不一致", "size does not match document.json")));
+    }
+    if (info.color_type, info.bit_depth, info.interlaced) != (png::ColorType::Grayscale, png::BitDepth::Sixteen, false) {
+        return Err(invalid(tr("不是 16 位灰度、不隔行的 PNG", "not a 16-bit grayscale, non-interlaced PNG")));
+    }
+    let mut reader = decoder.read_info().map_err(decode_error)?;
+    let fill = mask.default;
+    for y in rect.y0..rect.y1 {
+        let row = reader.next_row().map_err(decode_error)?.ok_or_else(|| invalid(tr("图像数据不完整", "image data is incomplete")))?;
+        if row.data().len() != w as usize * 2 {
+            return Err(invalid(tr("图像数据与文件头不符", "image data does not match its header")));
+        }
+        for (k, b) in row.data().as_chunks::<2>().0.iter().enumerate() {
+            let x = rect.x0 + k as i32;
+            let (tx, ty) = (x.div_euclid(TILE), y.div_euclid(TILE));
+            let v = div_round(u16::from_be_bytes(*b) as u64 * ONE64, MAX16) as u16;
+            mask.tiles.get_mut((tx, ty), fill)[((y - ty * TILE) * TILE + (x - tx * TILE)) as usize] = v;
+        }
+    }
+    reader.next_row().map_err(decode_error)?;
+    Ok(())
 }
 
 /// 把压缩包里的一张图层图像解码进 `tiles`。`rect` 是 `document.json` 给它定的位置，非空且在画布之内。
@@ -593,14 +834,14 @@ fn read_layer_png<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str, rect: Rec
     Ok(())
 }
 
-/// 把一行 16 位 RGBA（大端、非预乘）写进分块，从画布坐标 `(x_start, y)` 开始往右。
+/// 把一行 16 位 RGBA（大端、非预乘）写进分块，从画布坐标 `(x_start, y)` 开始往右（可以在画布外）。
 /// 整段全透明的地方不为它新建分块，图层照旧是稀疏的。
 fn store_row(tiles: &mut TileMap, x_start: i32, y: i32, row: &[u8]) {
     let x_end = x_start + (row.len() / 8) as i32;
-    let ty = y / TILE;
+    let ty = y.div_euclid(TILE);
     let mut x = x_start;
     while x < x_end {
-        let tx = x / TILE;
+        let tx = x.div_euclid(TILE);
         let x1 = ((tx + 1) * TILE).min(x_end);
         let (src, _) = row[((x - x_start) * 8) as usize..((x1 - x_start) * 8) as usize].as_chunks::<8>();
         if src.iter().any(|p| p[6] != 0 || p[7] != 0) {
@@ -742,16 +983,16 @@ mod tests {
         set_pixel(&mut paint, w - 1, 0, [ONE as u16; 4]);
         set_pixel(&mut paint, 0, h - 1, [3, 2, 1, 5]);
         set_pixel(&mut paint, w - 1, h - 1, [0, 0, 0, 1]);
-        // 右边和下边的分块伸出画布，外面那部分是连预乘都不合法的垃圾值，不该影响保存。
+        // 右边和下边的分块伸出画布，外面那部分也有内容：伸出画布的内容照样存（实现方案 §3.15）。
         for y in 0..192 {
             for x in 0..256 {
                 if x >= w || y >= h {
-                    set_pixel(&mut paint, x, y, [65535, 12345, 1, 7]);
+                    set_pixel(&mut paint, x, y, [20000, 12345, 1, 30000]);
                 }
             }
         }
-        // 还有整个在画布外的分块。
-        paint.tiles.get_mut((7, 7)).0.fill(40000);
+        // 还有整个在画布外的分块：左边那块在图层能放到的范围里，右下那块离画布太远。
+        paint.tiles.get_mut((7, 7)).0.fill(4000);
         paint.tiles.get_mut((-1, 0)).0.fill(123);
 
         // 中间：空图层。有一个全透明的分块和一个画布外的分块，仍然算空。
@@ -796,18 +1037,21 @@ mod tests {
             }
         }
         assert_eq!(back.flatten_rgb(), doc.flatten_rgb());
-        // 画布外的垃圾没有跟过来，空图层读回来一个分块也没有。
-        assert!(back.layers()[0].tiles.get((7, 7)).is_none() && back.layers()[0].tiles.get((-1, 0)).is_none());
+        // 伸出画布的内容跟过来了，离画布太远的没有；空图层读回来一个分块也没有。
+        for (x, y) in [(200, 0), (255, 191), (0, 130), (-64, 0), (-1, 63)] {
+            assert_eq!(pixel(&back.layers()[0], x, y), pixel(&doc.layers()[0], x, y), "({x}, {y})");
+        }
+        assert!(back.layers()[0].tiles.get((7, 7)).is_none());
         assert!(back.layers()[1].tiles.is_empty());
 
-        // document.json 里的矩形是裁到画布的内容包围盒。
+        // document.json 里的矩形是内容的包围盒（伸出画布的也算）。
         let meta: Value = serde_json::from_slice(&read_entry(&tmp.0, DOCUMENT_JSON)).unwrap();
-        assert_eq!((&meta["format"], &meta["version"], &meta["active"]), (&json!("zhibi"), &json!(1), &json!(1)));
+        assert_eq!((&meta["format"], &meta["version"], &meta["active"]), (&json!("zhibi"), &json!(2), &json!(1)));
         let rect = |i: usize| {
             let l = &meta["layers"][i];
             (l["x"].as_i64().unwrap(), l["y"].as_i64().unwrap(), l["width"].as_i64().unwrap(), l["height"].as_i64().unwrap())
         };
-        assert_eq!(rect(0), (0, 0, 200, 130));
+        assert_eq!(rect(0), (-64, 0, 320, 192));
         assert_eq!(rect(1), (0, 0, 0, 0));
         assert_eq!(rect(2), (70, 40, 21, 61));
         assert_eq!(meta["layers"][0]["file"], json!("layers/0000.png"));
@@ -1094,7 +1338,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_versions_and_canvas_sizes() {
-        expect_invalid(load_changed(|m| m["version"] = json!(2)), "更新版本");
+        expect_invalid(load_changed(|m| m["version"] = json!(3)), "更新版本");
         expect_invalid(load_changed(|m| m["version"] = json!(u64::MAX)), "更新版本");
         expect_invalid(load_changed(|m| m["version"] = json!(0)), "version");
         expect_invalid(load_changed(|m| m["version"] = json!("1")), "version");
@@ -1118,22 +1362,27 @@ mod tests {
     #[test]
     fn rejects_bad_layer_entries() {
         let layer = |change: fn(&mut Value)| load_changed(|m| change(&mut m["layers"][0]));
-        // 矩形放不进画布。
-        expect_invalid(layer(|l| l["x"] = json!(91)), "超出了画布");
-        expect_invalid(layer(|l| l["y"] = json!(77)), "超出了画布");
-        expect_invalid(layer(|l| l["x"] = json!(-1)), "超出了画布");
-        expect_invalid(layer(|l| l["width"] = json!(-10)), "超出了画布");
-        expect_invalid(layer(|l| l["height"] = json!(i64::MAX)), "超出了画布");
-        expect_invalid(layer(|l| l["x"] = json!(i64::MIN)), "超出了画布");
-        expect_invalid(layer(|l| l["width"] = json!(1i64 << 40)), "超出了画布");
+        // 矩形伸出画布太远（画布 100×80，图层能放到 −100..200、−80..160）。
+        expect_invalid(layer(|l| l["x"] = json!(191)), "离画布太远");
+        expect_invalid(layer(|l| l["y"] = json!(157)), "离画布太远");
+        expect_invalid(layer(|l| l["x"] = json!(-101)), "离画布太远");
+        expect_invalid(layer(|l| l["width"] = json!(-10)), "离画布太远");
+        expect_invalid(layer(|l| l["height"] = json!(i64::MAX)), "离画布太远");
+        expect_invalid(layer(|l| l["x"] = json!(i64::MIN)), "离画布太远");
+        expect_invalid(layer(|l| l["width"] = json!(1i64 << 40)), "离画布太远");
         expect_invalid(layer(|l| l["y"] = json!(1.5)), "不是整数");
         expect_invalid(layer(|l| l["width"] = json!(0)), "矩形却是空的");
-        // 刚好贴着右下角是可以的。
-        assert!(load_changed(|m| {
-            m["layers"][0]["x"] = json!(90);
-            m["layers"][0]["y"] = json!(76);
-        })
-        .is_ok());
+        // 刚好贴着画布右下角、伸出画布、刚好贴着能放到的范围的右下角，都是可以的。
+        for (x, y) in [(90, 76), (91, 77), (-100, -80), (190, 156)] {
+            assert!(
+                load_changed(|m| {
+                    m["layers"][0]["x"] = json!(x);
+                    m["layers"][0]["y"] = json!(y);
+                })
+                .is_ok(),
+                "({x}, {y})"
+            );
+        }
 
         expect_invalid(layer(|l| l["blend"] = json!("dissolve")), "混合模式");
         expect_invalid(layer(|l| l["blend"] = json!(3)), "混合模式");
@@ -1191,9 +1440,9 @@ mod tests {
         let errors = [
             message(load_parts("", None)),
             message(load_changed(|m| m["format"] = json!("openraster"))),
-            message(load_changed(|m| m["version"] = json!(2))),
+            message(load_changed(|m| m["version"] = json!(3))),
             message(load_changed(|m| m["width"] = json!(0))),
-            message(load_changed(|m| m["layers"][0]["x"] = json!(91))),
+            message(load_changed(|m| m["layers"][0]["x"] = json!(191))),
             message(load_changed(|m| m["layers"][0]["blend"] = json!("dissolve"))),
             message(load_parts(&base_meta().to_string(), None)),
             message(load_parts(&base_meta().to_string(), Some(&png16(11, 4, [0; 4])))),
@@ -1206,13 +1455,13 @@ mod tests {
             errors[1..3],
             [
                 r#"Not a Pen & Paper file (format in document.json is not "zhibi")"#,
-                "This file was saved by a newer version of Pen & Paper (format version 2); update the program to open it",
+                "This file was saved by a newer version of Pen & Paper (format version 3); update the program to open it",
             ]
         );
         assert_eq!(
             errors[4..],
             [
-                "Layer 1 has a rectangle (x 91, y 6, width 10, height 4) outside the canvas",
+                "Layer 1 has a rectangle (x 191, y 6, width 10, height 4) too far outside the canvas",
                 "Layer 1 has an unknown blend mode: dissolve",
                 "Image layers/0000.png of layer 1: not in the archive",
                 "Image layers/0000.png of layer 1: size does not match document.json (should be 10×4, is 11×4)",
@@ -1302,6 +1551,125 @@ mod tests {
                 let want = if inside { to_premultiplied(source(x as usize - 60, y as usize - 62)) } else { [0; 4] };
                 assert_eq!(pixel(&doc.layers()[0], x, y), want, "({x}, {y})");
             }
+        }
+    }
+
+    fn mask_value(layer: &Layer, x: i32, y: i32) -> Option<u16> {
+        let m = layer.mask.as_ref()?;
+        let (tx, ty) = (x.div_euclid(TILE), y.div_euclid(TILE));
+        Some(m.tiles.get((tx, ty)).map_or(m.default, |t| t[((y - ty * TILE) * TILE + (x - tx * TILE)) as usize]))
+    }
+
+    #[test]
+    fn round_trip_keeps_folders_masks_and_fills() {
+        let mut rng = Rng(77);
+        let mut inner = Layer::new("里面");
+        for y in 10..40 {
+            for x in 20..90 {
+                set_pixel(&mut inner, x, y, rng.pixel());
+            }
+        }
+        inner.depth = 1;
+        // 默认全黑、停用着、里面的值各不相同的蒙版，跨着分块的边界。
+        let mut mask = Mask { tiles: GrayMap::default(), default: 0, disabled: true };
+        for y in 50..80 {
+            for x in 50..140 {
+                let v = (rng.next() % (ONE + 1)) as u16;
+                mask.tiles.get_mut((x / TILE, y / TILE), 0)[((y % TILE) * TILE + x % TILE) as usize] = v;
+            }
+        }
+        inner.mask = Some(mask);
+        let mut folder = Layer::folder("文件夹");
+        folder.kind = Kind::Folder { open: false };
+        folder.props.blend = BlendMode::Multiply;
+        folder.props.pass_through = false;
+        folder.mask = Some(Mask::white());
+        let mut solid = Layer::new("颜色填充 1");
+        solid.kind = Kind::Fill(Fill { paint: Paint::Solid([12, 34, 56]), psd: Some((*b"SoCo", (0..=255).collect())) });
+        let mut other = Layer::new("渐变填充 1");
+        other.kind = Kind::Fill(Fill { paint: Paint::Other, psd: Some((*b"GdFl", vec![1, 2, 3, 4, 5])) });
+        other.props.visible = false;
+        let doc = Document::from_layers(160, 100, [255; 3], vec![inner, folder, solid, other]);
+
+        let tmp = Temp::new("tree.zhibi");
+        save(&doc, &tmp.0).unwrap();
+        let back = load(&tmp.0).unwrap();
+        assert_eq!(back.layers().len(), 4);
+        for (a, b) in doc.layers().iter().zip(back.layers()) {
+            assert_eq!((&a.props, &a.kind, a.depth), (&b.props, &b.kind, b.depth), "{}", a.props.name);
+            assert_eq!(a.mask.as_ref().map(|m| (m.default, m.disabled)), b.mask.as_ref().map(|m| (m.default, m.disabled)));
+            for y in 0..doc.height {
+                for x in 0..doc.width {
+                    assert_eq!(pixel(a, x, y), pixel(b, x, y), "{} 的像素 ({x}, {y})", a.props.name);
+                    assert_eq!(mask_value(a, x, y), mask_value(b, x, y), "{} 的蒙版 ({x}, {y})", a.props.name);
+                }
+            }
+        }
+        assert_eq!(back.flatten_rgb(), doc.flatten_rgb());
+
+        // 版本 1 的文件（没有这些字段）照常读，全部是最外层的像素图层。
+        let doc = load_changed(|m| m["version"] = json!(1)).unwrap();
+        assert!(doc.layers().iter().all(|l| l.is_pixels() && l.depth == 0 && l.mask.is_none()));
+        // 不认识的种类、坏的填充颜色算文件坏了。
+        expect_invalid(load_changed(|m| m["layers"][0]["kind"] = json!("text")), "种类");
+        expect_invalid(
+            load_changed(|m| {
+                m["layers"][0]["kind"] = json!("fill");
+                m["layers"][0]["fill"] = json!({ "type": "solid", "color": "red" });
+            }),
+            "填充颜色",
+        );
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b""), "");
+        for n in 0..300 {
+            let data: Vec<u8> = (0..n).map(|k| (k * 37 + n) as u8).collect();
+            assert_eq!(unbase64(&base64(&data)).as_deref(), Some(&data[..]));
+        }
+        assert_eq!(unbase64("TW!u"), None);
+    }
+
+    /// 给窗口测试用的文档（实现方案 0.3 的实测）：`ZHIBI_INTEROP_DIR` 指着的目录里写
+    /// `tree.zhibi`（文件夹、蒙版、填充图层，同 PSD 的测试）、`many-flat.zhibi` 和 `many-folders.zhibi`
+    /// （2000×1500，200 个半透明图层，各有一块 500×400；后一个分在 20 个文件夹里，一半穿透）。
+    #[test]
+    #[ignore]
+    fn write_window_test_docs() {
+        use crate::document::Layer;
+        use crate::tile::TILE;
+        let Some(dir) = std::env::var_os("ZHIBI_INTEROP_DIR").map(std::path::PathBuf::from) else { return };
+        save(&crate::psd::tests::tree_document(), &dir.join("tree.zhibi")).unwrap();
+        for folders in [false, true] {
+            let mut layers = Vec::new();
+            for g in 0..20 {
+                for k in 0..10 {
+                    let mut l = Layer::new(&format!("图层 {g}-{k}"));
+                    l.depth = folders as u16;
+                    l.props.opacity = 0.6;
+                    let (x0, y0) = ((g % 5) * 300 + k * 20, (g / 5) * 280 + k * 15);
+                    let c = [(g * 12) as u16 * 128, (k * 25) as u16 * 128, 90 * 128, crate::ONE as u16];
+                    for y in y0..y0 + 400 {
+                        for x in x0..x0 + 500 {
+                            let t = l.tiles.get_mut((x / TILE, y / TILE));
+                            let i = ((y % TILE) * TILE + x % TILE) as usize * 4;
+                            t.0[i..i + 4].copy_from_slice(&c);
+                        }
+                    }
+                    layers.push(l);
+                }
+                if folders {
+                    let mut f = Layer::folder(&format!("文件夹 {g}"));
+                    f.props.pass_through = g % 2 == 0;
+                    layers.push(f);
+                }
+            }
+            let doc = Document::from_layers(2000, 1500, [255; 3], layers);
+            save(&doc, &dir.join(if folders { "many-folders.zhibi" } else { "many-flat.zhibi" })).unwrap();
         }
     }
 }

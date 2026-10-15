@@ -12,6 +12,10 @@
 //! 这是和别的绘画软件交换用的格式，每通道只有 8 位，存一趟会丢掉本程序 15 位精度里多出来的那部分；
 //! 要原样保存请用自己的格式（`format` 模块）。
 //!
+//! 文件夹（规格 F-055）写成嵌套的 `<stack>`：穿透的写 `isolation="auto"`，普通的写 `isolation="isolate"`
+//! 和它的混合模式；读的时候反过来。规范里没有蒙版和填充图层：导出时把图层自己和外面各层文件夹的蒙版
+//! 乘进像素，填充图层画成像素（`Document::baked_pixels`）。
+//!
 //! 规范里没有"画布背景色"。保存时把背景色写成最底下一个名叫"背景"（英文界面下叫"Background"）的
 //! 不透明图层；读的时候，最底下的图层如果正是这个样子（名叫"背景"或"Background"、盖满画布、不透明、
 //! 只有一种颜色），就还原成背景色。
@@ -94,20 +98,39 @@ pub fn save(doc: &Document, path: &Path) -> io::Result<()> {
 }
 
 fn write_archive(doc: &Document, file: File) -> io::Result<()> {
-    let canvas = doc.bounds();
+    let keep = doc.keep_bounds();
     let layers = doc.layers();
-    let rects: Vec<Rect> = layers.iter().map(|l| content_bounds(&l.tiles, canvas)).collect();
+    // 蒙版、填充图层都乘进（画进）像素；文件夹没有像素。伸出画布的内容照写（位置可以是负的）。
+    let pixels: Vec<TileMap> = (0..layers.len()).map(|i| if layers[i].is_folder() { TileMap::default() } else { doc.baked_pixels(i) }).collect();
+    let rects: Vec<Rect> = pixels.iter().map(|t| content_bounds(t, keep)).collect();
     let file_name = |i: usize| format!("data/layer{i:03}.png");
 
     let dpi = doc.dpi.max(1);
     let mut xml = String::from("<?xml version='1.0' encoding='UTF-8'?>\n");
     let _ = writeln!(xml, r#"<image version="{SPEC_VERSION}" w="{}" h="{}" xres="{dpi}" yres="{dpi}">"#, doc.width, doc.height);
     xml.push_str(" <stack>\n");
-    // 规范规定最上面的图层写在最前面。
+    // 规范规定最上面的图层写在最前面；文件夹的 <stack> 写在它里面的东西前面，往下一行浅回去时关上。
+    let mut open = 0usize;
     for (i, (layer, r)) in layers.iter().zip(&rects).enumerate().rev() {
-        push_layer_element(&mut xml, &layer.props, &file_name(i), (r.x0, r.y0));
+        while open > layer.depth as usize {
+            open -= 1;
+            let _ = writeln!(xml, "{} </stack>", "  ".repeat(open + 1));
+        }
+        let indent = "  ".repeat(open + 1);
+        if layer.is_folder() {
+            push_stack_element(&mut xml, &indent, &layer.props);
+            open += 1;
+        } else {
+            xml.push_str(&indent);
+            push_layer_element(&mut xml, &layer.props, &file_name(i), (r.x0, r.y0));
+        }
+    }
+    while open > 0 {
+        open -= 1;
+        let _ = writeln!(xml, "{} </stack>", "  ".repeat(open + 1));
     }
     let background = LayerProps { name: background_name().into(), ..Default::default() };
+    xml.push_str("  ");
     push_layer_element(&mut xml, &background, BACKGROUND_PNG, (0, 0));
     xml.push_str(" </stack>\n</image>\n");
 
@@ -121,13 +144,16 @@ fn write_archive(doc: &Document, file: File) -> io::Result<()> {
     };
     add(MIMETYPE, MIMETYPE_CONTENT.as_bytes())?;
     add(STACK_XML, xml.as_bytes())?;
-    for (i, (layer, r)) in layers.iter().zip(&rects).enumerate() {
+    for (i, (tiles, r)) in pixels.iter().zip(&rects).enumerate() {
+        if layers[i].is_folder() {
+            continue;
+        }
         let png = if r.is_empty() {
             // 规范要求每个 <layer> 都有图像，空图层就给一张 1×1 的全透明图。
             encode_rgba8(1, 1, |_, row| row.fill(0))?
         } else {
             let (w, h) = ((r.x1 - r.x0) as u32, (r.y1 - r.y0) as u32);
-            encode_rgba8(w, h, |y, row| read_row(&layer.tiles, r.y0 + y as i32, r.x0, r.x1, row))?
+            encode_rgba8(w, h, |y, row| read_row(tiles, r.y0 + y as i32, r.x0, r.x1, row))?
         };
         add(&file_name(i), &png)?;
     }
@@ -144,13 +170,26 @@ fn write_archive(doc: &Document, file: File) -> io::Result<()> {
     file.sync_all()
 }
 
+/// 往 `stack.xml` 里加一个文件夹的 `<stack>` 开头（实现方案 §3.11）：穿透的是 `isolation="auto"`、
+/// 混合模式是普通的覆盖；普通的文件夹是 `isolation="isolate"` 和它自己的混合模式。
+fn push_stack_element(xml: &mut String, indent: &str, props: &LayerProps) {
+    let opacity = if props.opacity.is_nan() { 0.0 } else { props.opacity.clamp(0.0, 1.0) };
+    let (isolation, op) = if props.pass_through { ("auto", composite_op(BlendMode::Normal)) } else { ("isolate", composite_op(props.blend)) };
+    let _ = writeln!(
+        xml,
+        r#"{indent}<stack name="{}" opacity="{opacity}" visibility="{}" composite-op="{op}" isolation="{isolation}">"#,
+        escape_attr(&props.name),
+        if props.visible { "visible" } else { "hidden" },
+    );
+}
+
 /// 往 `stack.xml` 里加一个 `<layer>`。`offset` 是图像左上角在画布上的位置。
 fn push_layer_element(xml: &mut String, props: &LayerProps, src: &str, offset: (i32, i32)) {
     // 合成时非数当 0 用，这里保持一致。f32 的 Display 给出的是能原样读回来的最短写法（0.3 而不是 0.30000001）。
     let opacity = if props.opacity.is_nan() { 0.0 } else { props.opacity.clamp(0.0, 1.0) };
     let _ = writeln!(
         xml,
-        r#"  <layer name="{}" src="{}" x="{}" y="{}" opacity="{opacity}" visibility="{}" composite-op="{}"/>"#,
+        r#"<layer name="{}" src="{}" x="{}" y="{}" opacity="{opacity}" visibility="{}" composite-op="{}"/>"#,
         escape_attr(&props.name),
         escape_attr(src),
         offset.0,
@@ -251,7 +290,7 @@ fn thumbnail(rgb: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
 /// 文件打不开时原样返回系统的错误；文件内容不对时返回 `InvalidData`，附带说明。任何输入都不会让它崩溃。
 ///
 /// 本程序没有的东西这样处理：
-/// - 图层组展开成普通图层，组的可见性和不透明度并进组里的每个图层，组自己的混合模式不管；
+/// - 图层组读成文件夹，`isolation="auto"` 的是穿透的，别的是普通文件夹；
 /// - 不认识的混合模式改成"正常"；
 /// - 图层超出画布的部分裁掉；
 /// - 不是 PNG 的图层图像（规范允许别的格式，但不属于 baseline）跳过；
@@ -264,13 +303,25 @@ pub fn load(path: &Path) -> io::Result<(Document, Vec<String>)> {
     let mut notes = Notes::default();
     let stack = parse_stack(&read_stack_xml(&mut zip)?, &mut notes)?;
     let canvas = Rect { x0: 0, y0: 0, x1: stack.width, y1: stack.height };
+    let keep = Document::keep_area(stack.width, stack.height);
 
     let mut layers = Vec::with_capacity(stack.layers.len());
     // stack.xml 里最上面的图层排在最前，文档里的顺序是自下而上。
     for entry in stack.layers.into_iter().rev() {
+        if entry.folder {
+            if let Some(op) = &entry.unknown_op {
+                let name = &entry.props.name;
+                notes.layer(shared::unknown_blend_kind(), &trf!("{name}（{op:.40}）", "{name} ({op:.40})"));
+            }
+            let mut folder = Layer::folder(&entry.props.name);
+            folder.props = entry.props;
+            folder.depth = entry.depth;
+            layers.push(folder);
+            continue;
+        }
         let mut tiles = TileMap::default();
         let (name, src) = (&entry.props.name, &entry.src);
-        let outcome = read_layer_png(&mut zip, src, (entry.x, entry.y), canvas, &mut tiles).map_err(|e| {
+        let outcome = read_layer_png(&mut zip, src, (entry.x, entry.y), keep, &mut tiles).map_err(|e| {
             io::Error::new(e.kind(), trf!("图层“{name:.80}”的图像 {src:.80}：{e}", "Image {src:.80} of layer \"{name:.80}\": {e}"))
         })?;
         match outcome {
@@ -284,7 +335,9 @@ pub fn load(path: &Path) -> io::Result<(Document, Vec<String>)> {
         if let Some(op) = &entry.unknown_op {
             notes.layer(shared::unknown_blend_kind(), &trf!("{name}（{op:.40}）", "{name} ({op:.40})"));
         }
-        layers.push(Layer { props: entry.props, tiles });
+        let mut layer = Layer::pixels(entry.props, tiles);
+        layer.depth = entry.depth;
+        layers.push(layer);
     }
     let background = take_background(&mut layers, canvas).unwrap_or([255; 3]);
     let mut doc = Document::from_layers(stack.width, stack.height, background, layers);
@@ -315,7 +368,7 @@ fn read_stack_xml<R: Read + Seek>(zip: &mut ZipArchive<R>) -> io::Result<String>
     String::from_utf8(bytes).map_err(|_| invalid(tr("stack.xml 不是 UTF-8 编码的文本", "stack.xml is not UTF-8 text")))
 }
 
-/// `stack.xml` 的内容，已经检查过、图层组已经展开。
+/// `stack.xml` 的内容，已经检查过。
 struct Stack {
     width: i32,
     height: i32,
@@ -326,7 +379,11 @@ struct Stack {
 
 struct StackLayer {
     props: LayerProps,
-    /// 图像在压缩包里的路径
+    /// 是文件夹（嵌套的 `<stack>`）
+    folder: bool,
+    /// 嵌套深度：0 是最外层
+    depth: u16,
+    /// 图像在压缩包里的路径（文件夹没有）
     src: String,
     /// 图像左上角在画布上的位置，可以是负的，也可以在画布之外
     x: i64,
@@ -380,45 +437,72 @@ fn parse_stack(text: &str, notes: &mut Notes) -> io::Result<Stack> {
         .find(|c| c.name == "stack")
         .ok_or_else(|| invalid(tr("stack.xml 里没有图层列表 <stack>", "stack.xml has no layer list (<stack>)")))?;
     let mut flat = Flattened::default();
-    flatten(stack, true, 1.0, &mut flat)?;
-    if flat.groups > 0 {
-        notes.add(shared::groups_note(flat.groups));
-    }
+    flatten(stack, 0, &mut flat)?;
     if !flat.unknown.is_empty() {
         let names: Vec<String> = flat.unknown.iter().map(|n| format!("<{n:.40}>")).collect();
         let list = names.join(tr("、", ", "));
         notes.add(trf!("忽略了 stack.xml 里不认识的内容：{list}", "Ignored unknown content in stack.xml: {list}"));
     }
-    // 没有名字的图层按自下而上的位置起个名字。
-    let count = flat.layers.len();
-    for (i, layer) in flat.layers.iter_mut().enumerate() {
+    // 没有名字的图层按它在图层（不算文件夹）里自下而上的位置起个名字；没有名字的文件夹（组）就叫"组"。
+    let mut n = flat.layers.iter().filter(|l| !l.folder).count();
+    for layer in &mut flat.layers {
+        if layer.folder {
+            if layer.props.name.is_empty() {
+                layer.props.name = tr("组", "Group").to_string();
+            }
+            continue;
+        }
         if layer.props.name.is_empty() {
-            let n = count - i;
             layer.props.name = trf!("图层 {n}", "Layer {n}");
         }
+        n -= 1;
     }
     Ok(Stack { width: width as i32, height: height as i32, dpi: xres.or(yres).unwrap_or(DEFAULT_DPI), layers: flat.layers })
 }
 
 #[derive(Default)]
 struct Flattened {
+    /// 自上而下，文件夹排在它里面的东西前面
     layers: Vec<StackLayer>,
-    /// 遇到的图层组的个数
-    groups: usize,
     /// 遇到的不认识的元素的名字
     unknown: Vec<String>,
 }
 
-/// 把一个 `<stack>` 里的图层按文件里的顺序（自上而下）接到 `out` 后面，嵌套的组一并展开。
-/// `visible` 和 `opacity` 是外面各层图层组合起来的可见性与不透明度。
+/// 把一个 `<stack>` 里的东西按文件里的顺序（自上而下）接到 `out` 后面；嵌套的 `<stack>` 是文件夹，
+/// 先记它自己，再记它里面的东西，深度加一。规范里 `isolation` 默认是 `isolate`，就是普通文件夹；
+/// `auto` 是穿透的，这时规范说文件夹的混合模式不起作用，就不管它。
 /// 嵌套的层数不会超过 `MAX_XML_DEPTH`（解析 XML 时已经限制），所以可以放心地递归。
-fn flatten(stack: &Element, visible: bool, opacity: f32, out: &mut Flattened) -> io::Result<()> {
+fn flatten(stack: &Element, depth: u16, out: &mut Flattened) -> io::Result<()> {
     for child in &stack.children {
         match child.name.as_str() {
             "stack" => {
-                out.groups += 1;
-                let (group_visible, group_opacity) = visibility_and_opacity(child, tr("图层组", "a layer group"))?;
-                flatten(child, visible && group_visible, opacity * group_opacity, out)?;
+                if out.layers.len() >= MAX_LAYERS {
+                    return Err(invalid(trf!(
+                        "图层太多（超过 {MAX_LAYERS} 个），文件可能已损坏",
+                        "Too many layers (more than {MAX_LAYERS}); the file may be damaged"
+                    )));
+                }
+                let (visible, opacity) = visibility_and_opacity(child, tr("图层组", "a layer group"))?;
+                let pass_through = child.attr("isolation").map(str::trim) == Some("auto");
+                let op = child.attr("composite-op").map_or("svg:src-over", str::trim);
+                let blend = if pass_through { Some(BlendMode::Normal) } else { blend_of(op) };
+                out.layers.push(StackLayer {
+                    props: LayerProps {
+                        name: child.attr("name").unwrap_or_default().to_string(),
+                        opacity,
+                        visible,
+                        blend: blend.unwrap_or(BlendMode::Normal),
+                        pass_through,
+                        ..Default::default()
+                    },
+                    folder: true,
+                    depth,
+                    src: String::new(),
+                    x: 0,
+                    y: 0,
+                    unknown_op: blend.is_none().then(|| op.to_string()),
+                });
+                flatten(child, depth.saturating_add(1), out)?;
             }
             "layer" => {
                 if out.layers.len() >= MAX_LAYERS {
@@ -447,11 +531,13 @@ fn flatten(stack: &Element, visible: bool, opacity: f32, out: &mut Flattened) ->
                 out.layers.push(StackLayer {
                     props: LayerProps {
                         name: child.attr("name").unwrap_or_default().to_string(),
-                        opacity: opacity * layer_opacity,
-                        visible: visible && layer_visible,
+                        opacity: layer_opacity,
+                        visible: layer_visible,
                         blend: blend.unwrap_or(BlendMode::Normal),
                         ..Default::default()
                     },
+                    folder: false,
+                    depth,
                     src: src.to_string(),
                     x: offset("x")?,
                     y: offset("y")?,
@@ -505,13 +591,13 @@ enum PngOutcome {
     Read { clipped: bool },
 }
 
-/// 把压缩包里的一张图层图像解码进 `tiles`。`offset` 是它的左上角在画布上的位置。
-/// 8 位和 16 位的灰度、灰度加透明度、RGB、RGBA 以及调色板图像都能读。
+/// 把压缩包里的一张图层图像解码进 `tiles`。`offset` 是它的左上角在画布上的位置，伸出 `keep`
+/// （图层能放到的范围）的部分裁掉。8 位和 16 位的灰度、灰度加透明度、RGB、RGBA 以及调色板图像都能读。
 fn read_layer_png<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
     src: &str,
     offset: (i64, i64),
-    canvas: Rect,
+    keep: Rect,
     tiles: &mut TileMap,
 ) -> io::Result<PngOutcome> {
     let mut entry = match zip.by_name(src) {
@@ -577,8 +663,8 @@ fn read_layer_png<R: Read + Seek>(
     let mut put_row = |index: usize, data: &[u8]| {
         widen_row(data, samples, sample_bytes, &mut pixels);
         let y = y0 + index as i64;
-        clipped |= if (0..canvas.y1 as i64).contains(&y) {
-            store_row(tiles, canvas.x1, x0, y as i32, &pixels)
+        clipped |= if (keep.y0 as i64..keep.y1 as i64).contains(&y) {
+            store_row(tiles, keep, x0, y as i32, &pixels)
         } else {
             pixels.iter().any(|p| p[3] != 0)
         };
@@ -986,18 +1072,23 @@ pub(crate) mod shared {
         [ch(px[0]), ch(px[1]), ch(px[2]), a as u16]
     }
 
-    /// 图层在画布之内、按 8 位算不是全透明的像素的包围盒；没有这样的像素就是空矩形。
-    pub fn content_bounds(tiles: &TileMap, canvas: Rect) -> Rect {
-        let (tx_max, ty_max) = ((canvas.x1 - 1) / TILE, (canvas.y1 - 1) / TILE);
+    /// 图层在矩形 `area`（画布，或者图层能放到的范围）之内、按 8 位算不是全透明的像素的包围盒；
+    /// 没有这样的像素就是空矩形。
+    pub fn content_bounds(tiles: &TileMap, area: Rect) -> Rect {
+        if area.is_empty() {
+            return Rect::EMPTY;
+        }
+        let (tx0, ty0) = (area.x0.div_euclid(TILE), area.y0.div_euclid(TILE));
+        let (tx1, ty1) = ((area.x1 - 1).div_euclid(TILE), (area.y1 - 1).div_euclid(TILE));
         let mut bounds = Rect::EMPTY;
         for (tx, ty) in tiles.coords() {
-            // 先筛掉画布外的分块，下面乘 TILE 才不会溢出。
-            if tx < 0 || ty < 0 || tx > tx_max || ty > ty_max {
+            // 先筛掉范围外的分块，下面乘 TILE 才不会溢出。
+            if tx < tx0 || ty < ty0 || tx > tx1 || ty > ty1 {
                 continue;
             }
             let Some(tile) = tiles.get((tx, ty)) else { continue };
             let (ox, oy) = (tx * TILE, ty * TILE);
-            let clip = Rect { x0: ox, y0: oy, x1: ox + TILE, y1: oy + TILE }.intersect(canvas);
+            let clip = Rect { x0: ox, y0: oy, x1: ox + TILE, y1: oy + TILE }.intersect(area);
             // 已经整个落在包围盒里的分块不会再把它撑大，不用逐像素看。
             if bounds.union(clip) == bounds {
                 continue;
@@ -1013,12 +1104,12 @@ pub(crate) mod shared {
         bounds
     }
 
-    /// 图层第 `y` 行上 `x0..x1` 这一段（要在画布之内）的像素，写成 8 位、非预乘的 RGBA，放进 `out`。
+    /// 图层第 `y` 行上 `x0..x1` 这一段的像素（可以在画布外），写成 8 位、非预乘的 RGBA，放进 `out`。
     pub fn read_row(tiles: &TileMap, y: i32, x0: i32, x1: i32, out: &mut [u8]) {
-        let ty = y / TILE;
+        let ty = y.div_euclid(TILE);
         let mut x = x0;
         while x < x1 {
-            let tx = x / TILE;
+            let tx = x.div_euclid(TILE);
             let end = ((tx + 1) * TILE).min(x1);
             let dst = &mut out[((x - x0) * 4) as usize..((end - x0) * 4) as usize];
             match tiles.get((tx, ty)) {
@@ -1034,24 +1125,24 @@ pub(crate) mod shared {
         }
     }
 
-    /// 把一行 16 位、非预乘的 RGBA 写进分块。这一行在画布的第 `y` 行上（要在画布之内），从横坐标
-    /// `x_start` 开始往右；`x_start` 可以是负的，这一行也可以伸出画布的右边（画布宽 `canvas_width`），
-    /// 出界的部分裁掉。整段全透明的地方不为它新建分块，图层照旧是稀疏的。
+    /// 把一行 16 位、非预乘的 RGBA 写进分块。这一行在第 `y` 行上（要在 `area` 的上下范围之内），从横坐标
+    /// `x_start` 开始往右；伸出 `area` 左右的部分裁掉。`area` 是图层能放到的范围（`Document::keep_area`），
+    /// 读合并图像时是画布。整段全透明的地方不为它新建分块，图层照旧是稀疏的。
     ///
     /// 返回值：是不是有不透明的像素被裁掉了。
-    pub fn store_row(tiles: &mut TileMap, canvas_width: i32, x_start: i64, y: i32, row: &[[u16; 4]]) -> bool {
+    pub fn store_row(tiles: &mut TileMap, area: Rect, x_start: i64, y: i32, row: &[[u16; 4]]) -> bool {
         let x_end = x_start.saturating_add(row.len() as i64);
-        let (x0, x1) = (x_start.max(0), x_end.min(canvas_width as i64));
+        let (x0, x1) = (x_start.max(area.x0 as i64), x_end.min(area.x1 as i64));
         if x0 >= x1 {
             return row.iter().any(|p| p[3] != 0);
         }
         let (outside_left, rest) = row.split_at((x0 - x_start) as usize);
         let (inside, outside_right) = rest.split_at((x1 - x0) as usize);
         let (x0, x1) = (x0 as i32, x1 as i32);
-        let ty = y / TILE;
+        let ty = y.div_euclid(TILE);
         let mut x = x0;
         while x < x1 {
-            let tx = x / TILE;
+            let tx = x.div_euclid(TILE);
             let end = ((tx + 1) * TILE).min(x1);
             let src = &inside[(x - x0) as usize..(end - x0) as usize];
             if src.iter().any(|p| p[3] != 0) {
@@ -1074,6 +1165,10 @@ pub(crate) mod shared {
     pub fn take_background(layers: &mut Vec<Layer>, canvas: Rect) -> Option<[u8; 3]> {
         let bottom = layers.first()?;
         let p = &bottom.props;
+        // 只有最外层、没有蒙版的普通像素图层才可能是代表背景的那一个。
+        if !bottom.is_pixels() || bottom.depth != 0 || bottom.mask.is_some() || p.clip {
+            return None;
+        }
         if !BACKGROUND_NAMES.contains(&p.name.as_str()) || !p.visible || p.opacity < 1.0 || p.blend != BlendMode::Normal {
             return None;
         }
@@ -1185,9 +1280,12 @@ pub(crate) mod shared {
 
     // 两种格式共用的几句说明。
 
-    /// 图层有一部分在画布之外、被裁掉了（`Notes::layer` 的 `kind`）。
+    /// 图层伸出画布太远（四周各超过一个画布的宽或高），太远的部分被裁掉了（`Notes::layer` 的 `kind`）。
     pub fn clipped_kind() -> &'static str {
-        tr("下列图层有超出画布的内容，超出的部分已裁掉", "Cropped the parts outside the canvas from these layers")
+        tr(
+            "下列图层伸出画布太远（超过一个画布的宽或高），太远的部分已裁掉",
+            "Cropped the parts of these layers that reach more than a canvas width or height beyond the canvas",
+        )
     }
 
     /// 图层的混合模式本程序没有，改成了"正常"（`Notes::layer` 的 `kind`）。
@@ -1195,15 +1293,6 @@ pub(crate) mod shared {
         tr(
             "下列图层的混合模式本程序没有，已改为“正常”",
             "Layers whose blend mode this program does not have were set to Normal",
-        )
-    }
-
-    /// 文件里有 `groups` 个图层组，已经展开了。
-    pub fn groups_note(groups: usize) -> String {
-        trf!(
-            "文件里有 {groups} 个图层组，已展开成普通图层（组的可见性和不透明度并进了组里的图层，组的混合模式不起作用）",
-            "Flattened the file's layer groups ({groups}) into plain layers (group visibility and opacity were applied to \
-             the layers inside; group blend modes have no effect)"
         )
     }
 
@@ -1317,17 +1406,18 @@ pub(crate) mod shared {
             set_pixel(&mut paint, w - 1, 0, [ONE as u16; 4]);
             set_pixel(&mut paint, 0, h - 1, [300, 200, 100, 500]);
             set_pixel(&mut paint, w - 1, h - 1, [0, 0, 0, 100]);
-            // 右边和下边的分块伸出画布，外面那部分是连预乘都不合法的垃圾值，不该影响保存。
+            // 右边和下边的分块伸出画布，外面那部分也有内容：伸出画布的内容照样存（实现方案 §3.15）。
             for y in 0..192 {
                 for x in 0..256 {
                     if x >= w || y >= h {
-                        set_pixel(&mut paint, x, y, [65535, 12345, 1, 7]);
+                        set_pixel(&mut paint, x, y, [20000, 12345, 1, 30000]);
                     }
                 }
             }
             // 还有整个在画布外的分块。
-            paint.tiles.get_mut((7, 7)).0.fill(40000);
-            paint.tiles.get_mut((-1, 0)).0.fill(123);
+            // 还有整个在画布外的分块：左边那块在图层能放到的范围里，右下那块离画布太远。
+            paint.tiles.get_mut((7, 7)).0.fill(4000);
+            paint.tiles.get_mut((-1, 0)).0.fill(8000);
 
             // 空图层。有一个全透明的分块、一个画布外的分块、一个透明度低到 8 位下看不见的像素，仍然算空。
             let mut empty = Layer::new("空图层");
@@ -1469,6 +1559,17 @@ pub(crate) mod shared {
                         Err(e) => println!("{name}: 读不了：{e}"),
                     }
                     dump_for_interop(&result, &dir.join(format!("{name}.loaded")));
+                    // 合成之后的样子，和别的程序自己合成的对照。
+                    if let Ok((doc, _)) = &result {
+                        doc.export_png(&dir.join(format!("{name}.loaded.png"))).unwrap();
+                        let tree: Vec<String> = doc
+                            .layers()
+                            .iter()
+                            .rev()
+                            .map(|l| format!("{}{} {:?} {:.2} {:?}{}{}", "  ".repeat(l.depth as usize), l.props.name, l.props.blend, l.props.opacity, l.kind, if l.props.pass_through { " 穿透" } else { "" }, if l.mask.is_some() { " 蒙版" } else { "" }))
+                            .collect();
+                        println!("{}", tree.join("\n"));
+                    }
                 }
             }
         }
@@ -1480,6 +1581,8 @@ mod tests {
     use super::shared::testing::*;
     use super::shared::{to_premultiplied, to_straight8};
     use super::*;
+    use crate::document::Mask;
+    use crate::tile::{GrayMap, TILE};
     use crate::ONE;
 
     fn read_entry(path: &Path, name: &str) -> Vec<u8> {
@@ -1553,8 +1656,12 @@ mod tests {
         // 不透明度是按十进制小数原样写的，一点不差。
         assert_same_after_round_trip(&doc, &back, 0.0);
         assert_eq!(back.active(), doc.layers().len() - 1);
-        // 画布外的垃圾没有跟过来，空图层读回来一个分块也没有。
-        assert!(back.layers()[0].tiles.get((7, 7)).is_none() && back.layers()[0].tiles.get((-1, 0)).is_none());
+        // 伸出画布的内容跟过来了（只差 8 位量化），离画布太远的没有；空图层读回来一个分块也没有。
+        assert!(back.layers()[0].tiles.get((7, 7)).is_none());
+        for (x, y) in [(-64, 0), (-1, 63), (255, 191)] {
+            let (a, b) = (pixel(&doc.layers()[0], x, y), pixel(&back.layers()[0], x, y));
+            assert!(a.iter().zip(b).all(|(p, q)| p.abs_diff(q) <= 130), "({x}, {y})：{a:?} 对 {b:?}");
+        }
         assert!(back.layers()[1].tiles.is_empty());
         // 合成的结果只差在 8 位量化上。
         for (a, b) in doc.flatten_rgb().iter().zip(back.flatten_rgb()) {
@@ -1614,7 +1721,7 @@ mod tests {
         assert_eq!(attrs(&stack.children[6], &keys), ["空图层", "data/layer001.png", "0", "0", "0.37", "hidden", "svg:multiply"]);
         assert_eq!(
             attrs(&stack.children[7], &keys),
-            ["底色 paint", "data/layer000.png", "0", "0", "1", "visible", "svg:src-over"]
+            ["底色 paint", "data/layer000.png", "-64", "0", "1", "visible", "svg:src-over"]
         );
         assert_eq!(attrs(&stack.children[8], &keys), ["背景", "data/background.png", "0", "0", "1", "visible", "svg:src-over"]);
         assert_eq!(attrs(&stack.children[0], &["name", "composite-op"]), ["差值 4", "svg:difference"]);
@@ -1629,8 +1736,9 @@ mod tests {
         assert_eq!(data[..4], to_straight8(pixel(lines, 70, 40)));
         assert_eq!(data[data.len() - 4..], to_straight8(pixel(lines, 90, 100)));
         let (info, data) = decode_png(&read_entry(&tmp.0, "data/layer000.png"));
-        assert_eq!((info.width, info.height, (info.color_type, info.bit_depth)), (200, 130, rgba8));
-        assert!(data == straight8(&doc.layers()[0], doc.bounds()));
+        // 伸出画布的部分也写了：左边那一块（−64..0），右边和下边伸出去的（到 256、192）。
+        assert_eq!((info.width, info.height, (info.color_type, info.bit_depth)), (320, 192, rgba8));
+        assert!(data == straight8(&doc.layers()[0], Rect { x0: -64, y0: 0, x1: 256, y1: 192 }));
         let (info, data) = decode_png(&read_entry(&tmp.0, "data/layer001.png"));
         assert_eq!((info.width, info.height, data), (1, 1, vec![0; 4]));
         let (info, data) = decode_png(&read_entry(&tmp.0, BACKGROUND_PNG));
@@ -1698,6 +1806,46 @@ mod tests {
         // 16 位的文件精度更高，直接换算成 15 位，不先砍成 8 位。
         assert_eq!(to_premultiplied([65535, 32768, 2, 65535]), [ONE as u16, 16384, 1, ONE as u16]);
         assert_eq!(to_premultiplied([65535, 0, 0, 32768]), [16384, 0, 0, 16384]);
+    }
+
+    /// 文件夹存成嵌套的 <stack>，读回来还是同样的文件夹；蒙版乘进像素、填充图层画成像素，合成的样子不变。
+    #[test]
+    fn folders_survive_and_masks_and_fills_are_baked() {
+        let doc = crate::psd::tests::tree_document();
+        let mut layers = doc.layers().to_vec();
+        // 外层文件夹再加一个左边白、右边黑的蒙版：非黑即白的蒙版乘进每个图层和先合成再乘是一样的。
+        let mut m = Mask { tiles: GrayMap::default(), default: 0, disabled: false };
+        for y in 0..doc.height {
+            for x in 0..70 {
+                m.tiles.get_mut((x / TILE, y / TILE), 0)[((y % TILE) * TILE + x % TILE) as usize] = ONE as u16;
+            }
+        }
+        layers[3].mask = Some(m);
+        let doc = Document::from_layers(doc.width, doc.height, doc.background, layers);
+        let tmp = Temp::new("tree.ora");
+        save(&doc, &tmp.0).unwrap();
+        let xml = String::from_utf8(read_entry(&tmp.0, "stack.xml")).unwrap();
+        assert!(xml.contains(r#"<stack name="外" opacity="0.8" visibility="visible" composite-op="svg:multiply" isolation="isolate">"#), "{xml}");
+        assert!(xml.contains(r#"<stack name="里" opacity="1" visibility="hidden" composite-op="svg:src-over" isolation="auto">"#), "{xml}");
+
+        let (back, notes) = load(&tmp.0).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(back.layers().len(), doc.layers().len());
+        for (x, y) in doc.layers().iter().zip(back.layers()) {
+            let name = &x.props.name;
+            assert_eq!((&y.props.name, y.depth, y.is_folder()), (name, x.depth, x.is_folder()), "{name}");
+            assert!(y.mask.is_none() && (y.is_folder() || y.is_pixels()), "{name}");
+            assert_eq!((y.props.visible, y.props.blend, y.props.pass_through), (x.props.visible, x.props.blend, x.props.pass_through), "{name}");
+            assert_eq!(y.props.opacity, x.props.opacity, "{name}");
+        }
+        // 合成的样子只差 8 位的舍入。
+        let (a, b) = (doc.flatten_rgb(), back.flatten_rgb());
+        let worst = a.iter().zip(&b).map(|(p, q)| p.abs_diff(*q)).max().unwrap();
+        assert!(worst <= 1, "最多差 {worst}");
+        // 读回来的文档再存一遍，文件里的东西一样。
+        let again = Temp::new("tree-again.ora");
+        save(&back, &again.0).unwrap();
+        assert_eq!(read_entry(&again.0, "stack.xml"), read_entry(&tmp.0, "stack.xml"));
     }
 
     /// 分块 → 8 位 → 分块 → 8 位：任何像素写出去之后，读回来再写结果都一样。
@@ -1776,9 +1924,9 @@ mod tests {
 <image version="0.0.6" w="100" h="80" xres="150" yres="150" made-by='某个 "程序"'>
   <stack opacity="1" name="root">
     <layer name="顶层 &amp; 16 位" src="data/top.png" x="-3" y="70" opacity="0.5" composite-op="svg:multiply" mypaint:extra="1"/>
-    <stack name="组" opacity="0.5" visibility="hidden" composite-op="svg:screen" isolation="isolate">
+    <stack name="组" opacity="0.5" visibility="hidden" composite-op="svg:screen">
       <layer name="组里的灰度" src="data/grey.png" x="10" y="10" opacity="0.5"></layer>
-      <stack name="内层组">
+      <stack name="内层组" isolation="auto" composite-op="svg:difference">
         <layer src="data/palette.png" x="98" y="0" visibility="visible" composite-op="svg:color-dodge"/>
       </stack>
       <text x="1" y="2">这种元素不认识</text>
@@ -1824,20 +1972,26 @@ mod tests {
         let (doc, notes) = load_parts(xml, &images).unwrap();
 
         assert_eq!((doc.width, doc.height, doc.dpi, doc.background), (100, 80, 150, [255; 3]));
-        let props: Vec<_> =
-            doc.layers().iter().map(|l| (l.props.name.as_str(), l.props.opacity, l.props.visible, l.props.blend)).collect();
+        let props: Vec<_> = doc
+            .layers()
+            .iter()
+            .map(|l| (l.props.name.as_str(), l.depth, l.is_folder(), l.props.pass_through, l.props.opacity, l.props.visible, l.props.blend))
+            .collect();
         assert_eq!(
             props,
             [
-                ("RGB", 1.0, false, BlendMode::Add),
-                // 没有名字的图层按它在文件里自下而上的位置起名（跳过的那个矢量图层也占一个位置）；
-                // 它在两层组里，外层组是隐藏的、不透明度 0.5。
-                ("图层 3", 0.5, false, BlendMode::Normal),
-                ("组里的灰度", 0.25, false, BlendMode::Normal),
-                ("顶层 & 16 位", 0.5, true, BlendMode::Multiply),
+                ("RGB", 0, false, false, 1.0, false, BlendMode::Add),
+                // 没有名字的图层按它在图层里自下而上的位置起名（跳过的那个矢量图层也占一个位置，文件夹不占）。
+                ("图层 3", 2, false, false, 1.0, true, BlendMode::Normal),
+                // isolation="auto" 的组是穿透的，规范说这时组的混合模式不起作用；
+                // 没写 isolation 的组按规范是普通文件夹（isolate），带着自己的混合模式。
+                ("内层组", 1, true, true, 1.0, true, BlendMode::Normal),
+                ("组里的灰度", 1, false, false, 0.5, true, BlendMode::Normal),
+                ("组", 0, true, false, 0.5, false, BlendMode::Screen),
+                ("顶层 & 16 位", 0, false, false, 0.5, true, BlendMode::Multiply),
             ]
         );
-        let layer = |i: usize| &doc.layers()[i];
+        let layer = |i: usize| &doc.layers()[[0, 1, 3, 5][i]];
         let orange = to_premultiplied([255u16 * 257, 128 * 257, 0, 65535]);
         assert_eq!((pixel(layer(0), 0, 0), pixel(layer(0), 99, 79)), (orange, orange));
         // 调色板图层：只有 x=98 那个蓝色像素留了下来（x=99 是透明的，再往右出界了）。
@@ -1851,13 +2005,13 @@ mod tests {
         assert_eq!(content_bounds(&layer(3).tiles, doc.bounds()), Rect { x0: 0, y0: 70, x1: 7, y1: 80 });
         assert_eq!(pixel(layer(3), 6, 79), [16384, 0, 0, 16384]);
 
-        assert_eq!(notes.len(), 5, "{notes:?}");
-        expect_note(&notes, "有 2 个图层组");
+        assert_eq!(notes.len(), 3, "{notes:?}");
         expect_note(&notes, "不认识的内容：<text>");
         expect_note(&notes, "不是 PNG，已跳过：“矢量”");
         expect_note(&notes, "混合模式本程序没有，已改为“正常”：“图层 3（svg:color-dodge）”");
-        // 调色板图层出界的那个像素是不透明的蓝，16 位图层也有出界的部分。
-        expect_note(&notes, "超出的部分已裁掉：“图层 3”、“顶层 & 16 位”");
+        // 伸出画布的部分留着（实现方案 §3.15）：调色板图层右边出界的那个蓝像素，16 位图层左边和下边出界的部分。
+        assert_eq!(pixel(layer(1), 101, 0), [0, 0, ONE as u16, ONE as u16]);
+        assert_eq!(pixel(layer(3), -3, 89), [16384, 0, 0, 16384]);
     }
 
     #[test]
@@ -1995,16 +2149,13 @@ mod tests {
         let images: [(&str, &[u8]); 3] = [("a.png", &png), ("b.png", &png), ("c.svg", b"<svg/>")];
         let (doc, notes) = in_english(|| load_parts(xml, &images)).unwrap();
         let names: Vec<&str> = doc.layers().iter().map(|l| l.props.name.as_str()).collect();
-        assert_eq!(names, ["Layer 2", "下", "上"]);
+        assert_eq!(names, ["Layer 2", "下", "上", "Group"]);
         assert_eq!(
             notes,
             [
                 "The file has different horizontal and vertical resolutions (300 and 72 dpi); kept the horizontal one",
-                "Flattened the file's layer groups (1) into plain layers (group visibility and opacity were applied to the \
-                 layers inside; group blend modes have no effect)",
                 "Ignored unknown content in stack.xml: <text>",
                 r#"Skipped layers whose image is not a PNG: "矢量""#,
-                r#"Cropped the parts outside the canvas from these layers: "下", "上""#,
                 r#"Layers whose blend mode this program does not have were set to Normal: "上 (svg:hue)""#,
             ]
         );
@@ -2157,7 +2308,7 @@ mod tests {
         assert_eq!((doc.dpi, doc.layers()[0].props.opacity), (300, 0.0));
         assert!(doc.layers()[0].tiles.is_empty());
         expect_note(&notes, "分辨率不一样（300 和 72）");
-        expect_note(&notes, "超出的部分已裁掉：“图层 1”");
+        expect_note(&notes, "太远的部分已裁掉：“图层 1”");
         let (doc, _) = with(r#"w="10" h="10" yres="96.4""#, layer).unwrap();
         assert_eq!(doc.dpi, 96);
 
@@ -2367,6 +2518,10 @@ mod tests {
         let doc = sample_document();
         save(&doc, &dir.join("ours.ora")).unwrap();
         dump_for_interop(&Ok((doc, Vec::new())), &dir.join("ours.expected"));
+        // 有文件夹、蒙版、填充图层的那份（和 PSD 的测试同一个文档），合成的样子存成 `ours-tree.ora.png`。
+        let tree = crate::psd::tests::tree_document();
+        save(&tree, &dir.join("ours-tree.ora")).unwrap();
+        tree.export_png(&dir.join("ours-tree.ora.png")).unwrap();
     }
 
     #[test]

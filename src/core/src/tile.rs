@@ -3,6 +3,7 @@
 //! 所以撤销栈只要留着旧分块的引用就行。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::Rect;
@@ -29,23 +30,39 @@ impl Default for Tile {
     }
 }
 
+/// 分块表的改动编号：每改一次换一个全局唯一的号。编号一样，内容就一样（复制出来的表共用编号，
+/// 各自再改就各自换号），图层样式的缓存靠它判断要不要重算。
+static REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone, Default)]
 pub struct TileMap {
     tiles: HashMap<TileCoord, Arc<Tile>>,
+    rev: u64,
 }
 
 impl TileMap {
+    /// 改动编号（见 `REVISION`）。
+    pub fn revision(&self) -> u64 {
+        self.rev
+    }
+
     pub fn get(&self, c: TileCoord) -> Option<&Arc<Tile>> {
         self.tiles.get(&c)
     }
 
     /// 取可写的分块；不存在就新建一个全透明的，被别处引用着就先复制。
     pub fn get_mut(&mut self, c: TileCoord) -> &mut Tile {
+        self.rev = next_revision();
         Arc::make_mut(self.tiles.entry(c).or_insert_with(|| Arc::new(Tile::new())))
     }
 
     /// 把某个位置换成给定的分块（None 表示空），返回原来的。
     pub fn replace(&mut self, c: TileCoord, t: Option<Arc<Tile>>) -> Option<Arc<Tile>> {
+        self.rev = next_revision();
         match t {
             Some(t) => self.tiles.insert(c, t),
             None => self.tiles.remove(&c),
@@ -96,6 +113,50 @@ impl MaskMap {
         }
         let wanted: std::collections::HashSet<TileCoord> = coords.iter().copied().collect();
         self.tiles.iter_mut().filter(|(c, _)| wanted.contains(*c)).map(|(c, t)| (*c, t.as_mut_slice())).collect()
+    }
+}
+
+/// 单通道、写时复制的稀疏分块：图层蒙版（0..=ONE）。和 `TileMap` 一样，撤销栈只要留着旧分块的引用。
+#[derive(Clone, Default)]
+pub struct GrayMap {
+    tiles: HashMap<TileCoord, Arc<Vec<u16>>>,
+    rev: u64,
+}
+
+impl GrayMap {
+    /// 改动编号（同 `TileMap::revision`）。
+    pub fn revision(&self) -> u64 {
+        self.rev
+    }
+
+    pub fn get(&self, c: TileCoord) -> Option<&Arc<Vec<u16>>> {
+        self.tiles.get(&c)
+    }
+
+    /// 取可写的分块；不存在就新建一个全是 `fill` 的，被别处引用着就先复制。
+    pub fn get_mut(&mut self, c: TileCoord, fill: u16) -> &mut Vec<u16> {
+        self.rev = next_revision();
+        Arc::make_mut(self.tiles.entry(c).or_insert_with(|| Arc::new(vec![fill; N])))
+    }
+
+    pub fn replace(&mut self, c: TileCoord, t: Option<Arc<Vec<u16>>>) -> Option<Arc<Vec<u16>>> {
+        self.rev = next_revision();
+        match t {
+            Some(t) => self.tiles.insert(c, t),
+            None => self.tiles.remove(&c),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tiles.len()
+    }
+
+    pub fn coords(&self) -> impl Iterator<Item = TileCoord> + '_ {
+        self.tiles.keys().copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tiles.is_empty()
     }
 }
 

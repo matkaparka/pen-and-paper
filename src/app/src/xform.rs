@@ -5,10 +5,13 @@
 //!（中心、两个方向的缩放、旋转角）。前两层记在外框自己的坐标里（变换前的像素），
 //! 所以移动、缩放、旋转外框时，扭曲和弯曲跟着走。拖手柄只改这些数；
 //! 像素每次都从进入变换时存下的原图重新算，所以来回拖多少次都不会越拖越糊。
+//!
+//! 变换的对象是当前图层的像素和蒙版；当前是文件夹时，是里面所有图层的像素和蒙版（实现方案 §3.11、§3.12），
+//! 都用同一个变换。
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
-use zhibi_core::document::Document;
+use zhibi_core::document::{Document, Mask, Part};
 use zhibi_core::selection::Selection;
 use zhibi_core::tile::TileMap;
 use zhibi_core::transform::{self, Affine, Mapping, Quality};
@@ -67,10 +70,36 @@ struct Grab {
     offset: (f32, f32),
 }
 
-pub struct Xform {
+/// 变换的一样东西：某一层的像素，或者它的蒙版（画成"墨"，见 `Mask::to_ink`）。
+pub struct Piece {
     pub layer: usize,
-    /// 进入变换时这一层的像素
+    /// 是蒙版的话，原来的蒙版（变完照它的默认值、停用与否做回蒙版）
+    pub mask: Option<Mask>,
+    /// 进入变换时的像素（蒙版是它的墨）
     pub orig: TileMap,
+}
+
+impl Piece {
+    /// 变换后的像素（墨）做成要换进文档的东西。
+    pub fn part(&self, tiles: TileMap) -> Part {
+        match &self.mask {
+            Some(m) => Part::Mask(Some(m.with_ink(&tiles))),
+            None => Part::Pixels(tiles),
+        }
+    }
+
+    /// 进入变换之前的样子。
+    pub fn original(&self) -> Part {
+        match &self.mask {
+            Some(m) => Part::Mask(Some(m.clone())),
+            None => Part::Pixels(self.orig.clone()),
+        }
+    }
+}
+
+pub struct Xform {
+    /// 要变换的东西，至少一样
+    pub pieces: Vec<Piece>,
     /// 进入变换时的选区；有的话只变换选中的部分，选区也跟着走
     pub sel: Option<Selection>,
     /// 变换前内容的外框（画布坐标）
@@ -98,12 +127,28 @@ pub struct Xform {
 const CORNERS: [(i8, i8); 4] = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
 
 impl Xform {
-    /// 对当前图层（有选区时是选中的部分）开始变换。没有可变换的内容时返回 None。
+    /// 对当前图层（有选区时是选中的部分）开始变换：像素图层的像素和蒙版，填充图层的蒙版，
+    /// 文件夹里所有没锁的图层的这些东西。没有可变换的内容时返回 None。
     pub fn begin(doc: &Document, quick: bool) -> Option<Xform> {
-        let layer = doc.active();
-        let orig = doc.layers()[layer].tiles.clone();
+        let a = doc.active();
+        let range = if doc.layers()[a].is_folder() { doc.subtree(a) } else { a..a + 1 };
+        let mut pieces = Vec::new();
+        for i in range {
+            let l = &doc.layers()[i];
+            // 锁定的图层、锁定的组里面的图层不动。
+            if doc.is_locked(i) {
+                continue;
+            }
+            if l.is_pixels() {
+                pieces.push(Piece { layer: i, mask: None, orig: l.tiles.clone() });
+            }
+            if let Some(m) = &l.mask {
+                pieces.push(Piece { layer: i, mask: Some(m.clone()), orig: m.to_ink() });
+            }
+        }
         let sel = doc.selection().cloned();
-        let content = transform::content_bounds(&orig, doc.bounds());
+        // 外框包住全部内容，伸出画布的也算（实现方案 §3.15）。
+        let content = pieces.iter().fold(Rect::EMPTY, |r, p| r.union(transform::content_bounds(&p.orig, doc.keep_bounds())));
         let rect = match &sel {
             Some(s) if content.intersect(s.bounds()).is_empty() => Rect::EMPTY,
             Some(s) => s.bounds().intersect(doc.bounds()),
@@ -112,13 +157,12 @@ impl Xform {
         if rect.is_empty() {
             return None;
         }
-        Some(Xform::over(layer, orig, sel, rect, quick))
+        Some(Xform::over(pieces, sel, rect, quick))
     }
 
-    fn over(layer: usize, orig: TileMap, sel: Option<Selection>, rect: Rect, quick: bool) -> Xform {
+    fn over(pieces: Vec<Piece>, sel: Option<Selection>, rect: Rect, quick: bool) -> Xform {
         let mut x = Xform {
-            layer,
-            orig,
+            pieces,
             sel,
             rect,
             center: (0.0, 0.0),
@@ -450,12 +494,18 @@ impl Xform {
         }))))
     }
 
-    pub fn render(&self, quality: Quality, clip: Rect) -> TileMap {
-        match self.mapping() {
-            Some(Way::Affine(m)) => transform::transform_tiles(&self.orig, self.sel.as_ref(), &m, quality, clip),
-            Some(Way::Other(m)) => transform::map_tiles(&self.orig, self.sel.as_ref(), m.as_ref(), quality, clip),
-            None => self.orig.clone(),
-        }
+    /// 每样东西变换后的像素，和 `pieces` 一一对应。
+    pub fn render(&self, quality: Quality, clip: Rect) -> Vec<TileMap> {
+        let way = self.mapping();
+        let sel = self.sel.as_ref();
+        self.pieces
+            .iter()
+            .map(|p| match &way {
+                Some(Way::Affine(m)) => transform::transform_tiles(&p.orig, sel, m, quality, clip),
+                Some(Way::Other(m)) => transform::map_tiles(&p.orig, sel, m.as_ref(), quality, clip),
+                None => p.orig.clone(),
+            })
+            .collect()
     }
 
     /// 跟着内容一起变换后的选区。
@@ -546,11 +596,12 @@ fn wrap(a: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zhibi_core::document::Layer;
     use zhibi_core::tile::TILE;
     use zhibi_core::ONE;
 
     fn sample() -> Xform {
-        Xform::over(0, TileMap::default(), None, Rect { x0: 100, y0: 50, x1: 300, y1: 150 }, false)
+        Xform::over(Vec::new(), None, Rect { x0: 100, y0: 50, x1: 300, y1: 150 }, false)
     }
 
     fn close(a: (f32, f32), b: (f32, f32)) -> bool {
@@ -567,7 +618,7 @@ mod tests {
                 t.0[i..i + 4].copy_from_slice(&[ONE as u16; 4]);
             }
         }
-        Xform::over(0, tiles, None, r, false)
+        Xform::over(vec![Piece { layer: 0, mask: None, orig: tiles }], None, r, false)
     }
 
     fn alpha(tiles: &TileMap, x: i32, y: i32) -> u32 {
@@ -643,6 +694,39 @@ mod tests {
             x.turn(true);
         }
         assert!((x.angle).abs() < 1e-4);
+    }
+
+    /// 移出画布再移回来，内容一点不少（实现方案 §3.15）：像素以图层能放到的范围为界，不按画布裁。
+    #[test]
+    fn moving_off_the_canvas_and_back_keeps_everything() {
+        let mut layer = Layer::new("x");
+        for y in 30i32..60 {
+            for x in 150i32..190 {
+                let t = layer.tiles.get_mut((x.div_euclid(TILE), y.div_euclid(TILE)));
+                let i = (y.rem_euclid(TILE) * TILE + x.rem_euclid(TILE)) as usize * 4;
+                t.0[i..i + 4].copy_from_slice(&[ONE as u16; 4]);
+            }
+        }
+        let mut doc = Document::from_layers(200, 120, [255; 3], vec![layer]);
+        let original = doc.layers()[0].tiles.clone();
+        for (to, back) in [((270.0, 45.0), (170.0, 45.0)), ((170.0, -40.0), (170.0, 45.0))] {
+            let mut x = Xform::begin(&doc, true).unwrap();
+            x.grab(Handle::Move, (170.0, 45.0));
+            x.drag(to, false);
+            let moved = x.render(Quality::Best, doc.keep_bounds()).remove(0);
+            doc.replace_parts(vec![(0, Part::Pixels(moved))], None);
+            assert_eq!(alpha(&doc.layers()[0].tiles, 199, 45), 0, "移出去之后画布里看不见了");
+            let mut x = Xform::begin(&doc, true).unwrap();
+            x.grab(Handle::Move, to);
+            x.drag(back, false);
+            let returned = x.render(Quality::Best, doc.keep_bounds()).remove(0);
+            for y in 0..120 {
+                for xx in 0..200 {
+                    assert_eq!(alpha(&returned, xx, y), alpha(&original, xx, y), "({xx}, {y})");
+                }
+            }
+            doc.replace_parts(vec![(0, Part::Pixels(returned))], None);
+        }
     }
 
     #[test]
@@ -740,14 +824,14 @@ mod tests {
         let clip = Rect { x0: 0, y0: 0, x1: 260, y1: 220 };
         x.grab(Handle::Skew(0, 1), (90.0, 120.0));
         x.drag((130.0, 120.0), false);
-        let out = x.render(Quality::Best, clip);
+        let out = x.render(Quality::Best, clip).remove(0);
         // 下边滑到了 80..180，上边还在 40..140。
         assert_eq!(alpha(&out, 45, 42), ONE);
         assert_eq!(alpha(&out, 175, 117), ONE);
         assert_eq!(alpha(&out, 45, 117), 0);
         x.grab(Handle::Corner(1), (140.0, 40.0));
         x.drag((200.0, 20.0), false);
-        let out = x.render(Quality::Fast, clip);
+        let out = x.render(Quality::Fast, clip).remove(0);
         assert_eq!(alpha(&out, 192, 25), ONE, "拖出去的角那里有内容");
         assert_eq!(alpha(&out, 150, 22), 0);
     }
@@ -766,7 +850,7 @@ mod tests {
         // 别的点不动，外框四个角也不动。
         assert!(close(x.mesh_point(10), (140.0, 140.0)) && close(x.corners()[0], (60.0, 60.0)));
         // 线跟着那个点走到了 (80, 70)，原来的位置空了。
-        let out = x.render(Quality::Best, Rect { x0: 0, y0: 0, x1: 240, y1: 240 });
+        let out = x.render(Quality::Best, Rect { x0: 0, y0: 0, x1: 240, y1: 240 }).remove(0);
         // 线的中心线正好经过 (80, 70)，落在两行像素的交界上，所以看它周围 5×5 里的墨量。
         let around = |cx: i32, cy: i32| (-2..=2).flat_map(|dy| (-2..=2).map(move |dx| (dx, dy))).map(|(dx, dy)| alpha(&out, cx + dx, cy + dy)).sum::<u32>();
         assert!(around(80, 70) > 2 * ONE, "{}", around(80, 70));

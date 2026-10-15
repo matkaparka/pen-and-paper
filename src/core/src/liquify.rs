@@ -501,7 +501,8 @@ impl Liquify {
         let from = Rect { x0: area.x0.saturating_sub(g), y0: area.y0.saturating_sub(g), x1: area.x1.saturating_add(g), y1: area.y1.saturating_add(g) };
         for (tc, t) in transform::map_some(&self.orig, &FieldMap(&self.field), quality, self.clip, &moved, from) {
             let t = if self.keep_alpha { keep_alpha(self.orig.get(tc), t) } else { t };
-            out.push((tc, t));
+            // 只改画布里的；分块伸出画布的那部分照旧。
+            out.push((tc, transform::keep_outside(t, self.orig.get(tc), tc, self.clip)));
         }
         out
     }

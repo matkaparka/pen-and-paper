@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use keys::{Key, Keymap};
 use ui::{Kind, Layout, Popup, SliderId};
 use xform::{Handle, Mode, Xform};
-use zhibi_core::document::{BlendMode, Document, LayerProps, MAX_SIDE};
+use zhibi_core::document::{BlendMode, Document, Kind as LayerKind, LayerProps, Part, MAX_SIDE};
 use zhibi_core::fill::{self, FillOptions, Source};
 use zhibi_core::filter::{self, Adjust};
 use zhibi_core::liquify::{self, Liquify};
@@ -261,6 +261,20 @@ pub enum Cmd {
     /// 确定或者取消这次液化
     LiquifyOk,
     LiquifyCancel,
+    /// 新建文件夹、放进新文件夹（规格 F-055）
+    FolderNew,
+    Group,
+    /// 蒙版：添加、删除、停用或启用、应用，在蒙版和像素之间切换编辑对象（规格 F-058）
+    MaskAdd,
+    MaskDelete,
+    MaskToggle,
+    MaskApply,
+    MaskEdit,
+    /// 纯色填充图层改成前景色；填充图层栅格化（规格 F-061）
+    FillColor,
+    Rasterize,
+    /// 打开或关掉当前图层的样式（规格 F-062）
+    StyleToggle,
     /// 打开一个滤镜（规格 F-095）
     Filter(FilterKind),
     FilterOk,
@@ -381,6 +395,8 @@ const MENUS: &[(&str, &str, &[MenuItem])] = &[
         "Layer",
         &[
             (301, "新建图层", "New Layer", Cmd::LayerNew),
+            (314, "新建组", "New Group", Cmd::FolderNew),
+            (315, "放进新组", "Put into New Group", Cmd::Group),
             (302, "复制图层", "Duplicate Layer", Cmd::LayerDup),
             (303, "删除图层", "Delete Layer", Cmd::LayerDel),
             (0, "", "", Cmd::Exit),
@@ -389,6 +405,9 @@ const MENUS: &[(&str, &str, &[MenuItem])] = &[
             (306, "向下合并", "Merge Down", Cmd::LayerMerge),
             (311, "合并可见图层", "Merge Visible", Cmd::MergeVisible),
             (312, "拼合成一层", "Flatten", Cmd::Flatten),
+            (0, "", "", Cmd::Exit),
+            (316, "添加蒙版", "Add Mask", Cmd::MaskAdd),
+            (317, "应用蒙版", "Apply Mask", Cmd::MaskApply),
             (0, "", "", Cmd::Exit),
             (307, "左右翻转", "Flip Horizontal", Cmd::FlipH),
             (308, "上下翻转", "Flip Vertical", Cmd::FlipV),
@@ -482,6 +501,8 @@ enum Drag {
 /// 界面上正在被按住拖动的部件。
 #[derive(Clone)]
 enum Grab {
+    /// 图层列表里的一行：按下时的纵坐标，拖开了没有（拖开了就是在拖动排序）
+    Layer { y0: i32, moving: bool },
     Button(Cmd, RECT),
     Slider(SliderId, RECT),
     /// 色环的外圈（true）或中间方块（false）
@@ -577,6 +598,12 @@ pub struct App {
     pen_eraser: Option<Tool>,
     /// 正在原地改名的图层和它的输入框
     rename: Option<(usize, HWND)>,
+    /// 图层列表往下滚过了几行
+    pub layer_scroll: usize,
+    /// 拖动图层时松手会放到哪里
+    pub layer_drop: Option<ui::Drop>,
+    /// 上次排界面时的当前图层和图层个数
+    listed_state: (usize, usize),
 }
 
 thread_local! {
@@ -625,7 +652,9 @@ impl App {
     }
 
     fn fill_options(&self) -> FillOptions {
-        let source = if self.fill_merged { Source::Merged } else { Source::Layer(self.doc.active()) };
+        // 当前不是像素图层（文件夹、填充图层）时，看的是整个画面。
+        let pixels = self.doc.layers()[self.doc.active()].is_pixels();
+        let source = if self.fill_merged || !pixels { Source::Merged } else { Source::Layer(self.doc.active()) };
         FillOptions { tolerance: self.tolerance, gap: self.gap, source }
     }
 
@@ -650,6 +679,7 @@ impl App {
 
     fn relayout(&mut self) {
         self.layout = ui::build(self, self.client());
+        self.listed_state = (self.doc.active(), self.doc.layers().len());
     }
 
     fn update_title(&self) {
@@ -694,9 +724,56 @@ impl App {
         self.relayout();
     }
 
+    /// 当前工具在当前图层上用得上吗。油漆桶、液化只对像素图层的像素（实现方案 §3.12）；
+    /// 画笔类的工具还能画蒙版。
+    fn tool_can_act(&self) -> bool {
+        match self.tool {
+            Tool::Liquify | Tool::Bucket => self.doc.can_edit_pixels(),
+            _ => self.doc.can_edit_active(),
+        }
+    }
+
+    /// 当前图层上为什么画不了、滤镜用不了，给面板上的提示用（每项一行）。都用得了时是空的。
+    /// 画笔圆环里的斜杠、滤镜菜单变灰，说的就是这些。
+    pub fn blocked_reason(&self) -> Vec<&'static str> {
+        let doc = &self.doc;
+        let a = doc.active();
+        let l = &doc.layers()[a];
+        if doc.can_edit_pixels() && self.tool_can_act() {
+            return Vec::new();
+        }
+        let chain = || std::iter::once(a).chain(doc.ancestors(a));
+        if chain().any(|i| !doc.layers()[i].props.visible) {
+            return vec![tr("当前图层（或它所在的组）隐藏着", "The layer or its group is hidden"), tr("显示出来才能画、才能用滤镜", "Show it to paint or filter")];
+        }
+        if doc.is_locked(a) {
+            return vec![tr("当前图层（或它所在的组）锁定着", "The layer or its group is locked"), tr("解锁之后才能画、才能用滤镜", "Unlock it to paint or filter")];
+        }
+        let mask = doc.mask_target();
+        match l.kind {
+            LayerKind::Folder { .. } if mask => vec![tr("正在画组的蒙版", "Painting the group\u{2019}s mask"), tr("滤镜只能用在普通图层上", "Filters work on ordinary layers only")],
+            LayerKind::Folder { .. } => vec![
+                tr("当前选中的是组", "The current layer is a group"),
+                tr("组本身不能画，也不能用滤镜", "Groups can\u{2019}t be painted or filtered"),
+                tr("在图层列表里点一个普通图层", "Click an ordinary layer in the list"),
+            ],
+            LayerKind::Fill(_) if mask => vec![tr("正在画填充图层的蒙版", "Painting the fill layer\u{2019}s mask"), tr("滤镜只能用在普通图层上", "Filters work on ordinary layers only")],
+            LayerKind::Fill(_) => vec![
+                tr("当前是填充图层", "The current layer is a fill layer"),
+                tr("不能直接画，也不能用滤镜", "It can\u{2019}t be painted or filtered"),
+                tr("可以点“蒙”画它的蒙版，或者栅格化", "Paint its mask (M) or rasterize it"),
+            ],
+            LayerKind::Pixels => vec![
+                tr("正在画蒙版", "Painting on the mask"),
+                tr("滤镜、液化、油漆桶只改像素", "Filters, liquify, bucket: pixels only"),
+                tr("点图层的名字回到画像素", "Click the layer name for pixels"),
+            ],
+        }
+    }
+
     fn ring_radius(&self) -> f32 {
         // 画不上的时候圆环里要画一道斜杠，太小了看不出来。
-        let least = if self.doc.can_edit_active() { 1.5 } else { 8.0 };
+        let least = if self.tool_can_act() { 1.5 } else { 8.0 };
         let size = if self.tool == Tool::Liquify { self.liquid.size } else { self.brush().size };
         (size * self.view.zoom / 2.0).max(least)
     }
@@ -750,8 +827,8 @@ impl App {
         if self.hovering && matches!(self.drag, Drag::None | Drag::Liquify) && self.shows_ring() {
             let r = self.ring_radius();
             draw_ring(buf, stride, origin, vp, self.last_pos, r);
-            // 当前图层锁定或者隐藏着，画不上：圆环里加一道斜杠。
-            if !self.doc.can_edit_active() {
+            // 当前图层锁定或者隐藏着、是文件夹，或者这个工具对蒙版不能用，画不上：圆环里加一道斜杠。
+            if !self.tool_can_act() {
                 let (c, d) = (self.last_pos, r * 0.7);
                 dashed(buf, stride, origin, Rect { x0: 0, y0: 0, x1: vp.0, y1: vp.1 }, (c.0 - d, c.1 + d), (c.0 + d, c.1 - d));
             }
@@ -843,10 +920,40 @@ impl App {
         }
     }
 
-    /// 整张画布的内容都可能变了（图层结构、属性）。
+    /// 整张画布的内容都可能变了（图层结构、属性）。当前图层换了、图层多了或少了的话，
+    /// 图层列表滚到当前图层那里；只是改了显隐、不透明度这些，列表不动。
     fn document_changed(&mut self) {
         self.display.invalidate_all();
+        if self.listed_state != (self.doc.active(), self.doc.layers().len()) {
+            self.reveal_active();
+        }
         self.refresh_all();
+    }
+
+    /// 图层列表滚到当前图层露出来的地方（它在折叠的文件夹里时不动）。
+    fn reveal_active(&mut self) {
+        let a = self.doc.active();
+        let listed: Vec<usize> = (0..self.doc.layers().len()).rev().filter(|&i| self.doc.listed(i)).collect();
+        let Some(p) = listed.iter().position(|&i| i == a) else { return };
+        let fit = self.layout.layer_rows.max(1);
+        if p < self.layer_scroll {
+            self.layer_scroll = p;
+        } else if p >= self.layer_scroll + fit {
+            self.layer_scroll = p + 1 - fit;
+        }
+    }
+
+    /// 展开或折叠一个文件夹。当前图层在折起来的文件夹里时，当前图层换成这个文件夹。
+    fn toggle_folder(&mut self, index: usize) {
+        let open = matches!(self.doc.layers()[index].kind, zhibi_core::document::Kind::Folder { open: true });
+        self.doc.set_folder_open(index, !open);
+        if open && self.doc.ancestors(self.doc.active()).contains(&index) {
+            self.end_xform(true);
+            self.end_liquify(true);
+            self.end_filter(true);
+            self.doc.set_active(index);
+        }
+        self.refresh_ui();
     }
 
     /// 修饰键当前是否算数。刚按完"修饰键 + 按键"时手指往往还没松开，
@@ -1042,8 +1149,8 @@ impl App {
                 self.pick_color(pos);
                 self.refresh_all();
             }
-            // 当前图层锁定或者隐藏着：不开始这一笔。
-            _ if !self.doc.can_edit_active() => self.drag = Drag::Done,
+            // 当前图层锁定或者隐藏着、是文件夹，或者这个工具对蒙版不能用：不开始这一笔。
+            _ if !self.tool_can_act() => self.drag = Drag::Done,
             Tool::Liquify => {
                 if self.liquify.is_none() {
                     self.liquify = Liquify::begin(&self.doc);
@@ -1130,9 +1237,10 @@ impl App {
     }
 
     /// 开始移动或自由变换（规格 F-080、F-081）。当前图层（有选区时是选中的部分）没有内容时什么也不做。
+    /// 当前是文件夹时变换里面所有的图层；蒙版跟着图层一起变。
     fn begin_xform(&mut self, quick: bool) -> bool {
         if self.xform.is_none() {
-            if !self.doc.can_edit_active() {
+            if !self.doc.active_open() {
                 return false;
             }
             let Some(x) = Xform::begin(&self.doc, quick) else { return false };
@@ -1146,27 +1254,41 @@ impl App {
     /// 结束变换。`keep` 为 false 时放弃，像素和选区都回到开始前的样子。
     fn end_xform(&mut self, keep: bool) {
         let Some(x) = self.xform.take() else { return };
-        let clip = self.doc.bounds();
+        // 像素以图层能放到的范围为界（伸出画布的内容跟着走，实现方案 §3.15），选区以画布为界。
+        let (area, canvas) = (self.doc.keep_bounds(), self.doc.bounds());
         // 预览期间图层里放的是预览用的像素，先换回原图。
-        self.doc.set_layer_tiles_live(x.layer, x.orig.clone());
+        for p in &x.pieces {
+            self.set_part_live(p.layer, p.original());
+        }
         self.doc.set_selection(x.sel.clone());
         if keep && !x.is_identity() {
-            let tiles = x.render(Quality::Best, clip);
-            match x.moved_selection(clip) {
-                Some(sel) => self.doc.replace_layer_tiles_and_selection(x.layer, tiles, Some(sel)),
-                None => self.doc.replace_layer_tiles(x.layer, tiles),
-            };
+            let parts = x.pieces.iter().zip(x.render(Quality::Best, area)).map(|(p, t)| (p.layer, p.part(t))).collect();
+            self.doc.replace_parts(parts, x.moved_selection(canvas).map(Some));
         }
         self.document_changed();
     }
 
+    /// 预览时把某一层的像素或者蒙版换掉（不记撤销）。
+    fn set_part_live(&mut self, layer: usize, part: Part) {
+        match part {
+            Part::Pixels(tiles) => {
+                self.doc.set_layer_tiles_live(layer, tiles);
+            }
+            Part::Mask(mask) => {
+                self.doc.set_mask_live(layer, mask);
+            }
+        }
+    }
+
     /// 变换的参数变了之后，把预览像素重算一遍。放在重画之前做，这样连着来的几次拖动只算一次。
     fn flush_xform(&mut self) {
-        let clip = self.doc.bounds();
+        let clip = self.doc.keep_bounds();
         let Some(x) = self.xform.as_mut().filter(|x| x.stale) else { return };
         x.stale = false;
-        let (layer, tiles) = (x.layer, x.render(Quality::Fast, clip));
-        self.doc.set_layer_tiles_live(layer, tiles);
+        let parts: Vec<(usize, Part)> = x.pieces.iter().zip(x.render(Quality::Fast, clip)).map(|(p, t)| (p.layer, p.part(t))).collect();
+        for (layer, part) in parts {
+            self.set_part_live(layer, part);
+        }
         self.display.invalidate_all();
     }
 
@@ -1232,9 +1354,9 @@ impl App {
         self.document_changed();
     }
 
-    /// 打开一个滤镜（规格 F-095）。当前图层锁定或者隐藏着时什么也不做。
+    /// 打开一个滤镜（规格 F-095）。当前图层锁定或者隐藏着、编辑的是蒙版、不是像素图层时什么也不做。
     fn begin_filter(&mut self, kind: FilterKind) {
-        if !self.doc.can_edit_active() {
+        if !self.doc.can_edit_pixels() {
             return;
         }
         let layer = self.doc.active();
@@ -1404,6 +1526,48 @@ impl App {
             }
             Cmd::MergeVisible => {
                 self.doc.merge_visible();
+                self.document_changed();
+            }
+            Cmd::FolderNew => {
+                self.doc.add_folder();
+                self.document_changed();
+            }
+            Cmd::Group => {
+                self.doc.group_active();
+                self.document_changed();
+            }
+            Cmd::MaskAdd => {
+                self.doc.add_mask();
+                self.document_changed();
+            }
+            Cmd::MaskDelete => {
+                self.doc.remove_mask();
+                self.document_changed();
+            }
+            Cmd::MaskToggle => {
+                self.doc.toggle_mask();
+                self.document_changed();
+            }
+            Cmd::MaskApply => {
+                self.doc.apply_mask();
+                self.document_changed();
+            }
+            Cmd::MaskEdit => {
+                let on = !self.doc.mask_target();
+                self.doc.set_mask_target(on);
+                self.refresh_all();
+            }
+            Cmd::FillColor => {
+                let color = self.color();
+                self.doc.set_fill_color(color);
+                self.document_changed();
+            }
+            Cmd::Rasterize => {
+                self.doc.rasterize();
+                self.document_changed();
+            }
+            Cmd::StyleToggle => {
+                self.doc.toggle_style();
                 self.document_changed();
             }
             Cmd::Flatten => {
@@ -1690,35 +1854,74 @@ impl App {
                     }
                     Kind::LayerRow { index } => {
                         let index = *index;
-                        if ui::contains(&ui::eye_rect(&rect, self.scale), x, y) {
+                        let parts = ui::row_parts(&rect, self.scale, &self.doc.layers()[index]);
+                        if ui::contains(&parts.eye, x, y) {
                             let before = self.doc.layers()[index].props.clone();
                             self.doc.set_props_live(index, LayerProps { visible: !before.visible, ..before.clone() });
                             self.doc.commit_props(index, before);
                             self.document_changed();
+                        } else if parts.arrow.is_some_and(|a| ui::contains(&a, x, y)) {
+                            self.toggle_folder(index);
                         } else {
                             // 换图层之前先把进行中的变换确认下来，免得它留在别的图层上。
-                            if index != self.doc.active() {
+                            let on_mask = parts.mask.is_some_and(|m| ui::contains(&m, x, y));
+                            if index != self.doc.active() || on_mask != self.doc.mask_target() {
                                 self.end_xform(true);
                                 self.end_liquify(true);
                                 self.end_filter(true);
                             }
+                            // 点蒙版那一格编辑蒙版，点别处编辑像素（规格 F-058）。
                             self.doc.set_active(index);
-                            self.refresh_ui();
-                            if msg == WM_LBUTTONDBLCLK {
-                                return Some(Later::Rename(index, ui::name_rect(&rect, self.scale)));
+                            self.doc.set_mask_target(on_mask);
+                            self.refresh_all();
+                            if msg == WM_LBUTTONDBLCLK && !on_mask {
+                                return Some(Later::Rename(index, parts.name));
                             }
+                            // 按着拖开就是拖动排序（规格 F-050）。
+                            self.grab = Some(Grab::Layer { y0: y, moving: false });
                         }
                     }
-                    Kind::Label(_) => {}
+                    Kind::Label(_) | Kind::Note(_) | Kind::Thumb | Kind::DropMark { .. } => {}
                 }
             }
             WM_MOUSEMOVE => match self.grab.clone() {
                 Some(Grab::Slider(id, rect)) => self.set_slider(id, &rect, x),
                 Some(Grab::Wheel(ring, rect)) => self.set_wheel(ring, &rect, x, y),
+                Some(Grab::Layer { y0, moving }) => {
+                    if !moving && (y - y0).abs() < (6.0 * self.scale) as i32 {
+                        return None;
+                    }
+                    self.grab = Some(Grab::Layer { y0, moving: true });
+                    // 拖出图层那一列再松手就是不挪。
+                    let l = &self.layout.layers;
+                    let inside = x >= l.left && x < l.right;
+                    let drop = if inside { ui::drop_at(&self.doc, &self.layout, y, self.scale) } else { None };
+                    if drop != self.layer_drop {
+                        self.layer_drop = drop;
+                        self.refresh_ui();
+                    }
+                }
                 _ => {}
             },
             WM_LBUTTONUP => {
                 let grab = self.grab.take();
+                if let Some(Grab::Layer { moving: true, .. }) = grab {
+                    if let Some(d) = self.layer_drop.take() {
+                        // 进行中的变换、液化、滤镜记着图层的序号，挪动之前先确定下来。
+                        self.end_xform(true);
+                        self.end_liquify(true);
+                        self.end_filter(true);
+                        if self.doc.move_active_to(d.gap, d.depth) {
+                            // 放进了折着的文件夹：把它展开，好看见放到了哪里。
+                            for j in self.doc.ancestors(self.doc.active()) {
+                                self.doc.set_folder_open(j, true);
+                            }
+                            self.document_changed();
+                        }
+                    }
+                    self.refresh_ui();
+                    return None;
+                }
                 if let Some((index, before)) = self.props_before.take() {
                     self.doc.commit_props(index, before);
                     self.refresh_ui();
@@ -1788,6 +1991,19 @@ impl App {
                 }
             }
         }
+    }
+
+    /// 菜单里会变灰的几项（编号、能不能用）：当前图层用不了的滤镜和蒙版命令。
+    fn menu_states(&self) -> Vec<(u16, bool)> {
+        let l = &self.doc.layers()[self.doc.active()];
+        let filters = self.doc.can_edit_pixels();
+        vec![
+            (701, filters),
+            (702, filters),
+            (703, filters),
+            (316, l.mask.is_none() && !self.doc.is_locked(self.doc.active())),
+            (317, l.mask.is_some() && l.is_pixels() && !self.doc.is_locked(self.doc.active())),
+        ]
     }
 
     /// 菜单里带勾的几项跟着当前状态打勾。
@@ -2078,7 +2294,7 @@ fn main() -> Result<()> {
                 display: Display::default(),
                 view,
                 back: None,
-                layout: Layout { top: empty, left: empty, layers: empty, canvas: empty, items: Vec::new() },
+                layout: Layout { top: empty, left: empty, layers: empty, canvas: empty, items: Vec::new(), layer_rows: 0, layer_first: 0 },
                 panels: saved.usize("panels", 1) != 0,
                 tool: Tool::Pen,
                 brushes,
@@ -2123,6 +2339,9 @@ fn main() -> Result<()> {
                 held: None,
                 pen_eraser: None,
                 rename: None,
+                layer_scroll: 0,
+                layer_drop: None,
+                listed_state: (usize::MAX, 0),
             })
         });
         let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
@@ -2428,8 +2647,14 @@ fn run_later(hwnd: HWND, later: Later) {
                     (0..=15).map(|n| (n as u32 + 1, if n == 0 { tr("0（关）", "0 (off)").to_string() } else { n.to_string() }, n == cur)).collect()
                 }
                 Popup::Blend => {
-                    let cur = with_app(|app| app.doc.layers()[app.doc.active()].props.blend).unwrap_or(BlendMode::Normal);
-                    BlendMode::ALL.iter().enumerate().map(|(i, m)| (i as u32 + 1, m.label().to_string(), *m == cur)).collect()
+                    let (cur, folder) = with_app(|app| {
+                        let l = &app.doc.layers()[app.doc.active()];
+                        ((!l.is_folder() || !l.props.pass_through).then_some(l.props.blend), l.is_folder())
+                    })
+                    .unwrap_or((Some(BlendMode::Normal), false));
+                    // 文件夹的第一项是"穿透"（实现方案 §3.11），编号排在混合模式后面。
+                    let pass = folder.then(|| (BlendMode::ALL.len() as u32 + 1, tr("穿透", "Pass Through").to_string(), cur.is_none()));
+                    pass.into_iter().chain(BlendMode::ALL.iter().enumerate().map(|(i, m)| (i as u32 + 1, m.label().to_string(), Some(*m) == cur))).collect()
                 }
             };
             let Some(choice) = dialogs::popup(hwnd, at, &items) else { return };
@@ -2441,7 +2666,11 @@ fn run_later(hwnd: HWND, later: Later) {
                 Popup::Blend => {
                     let index = app.doc.active();
                     let before = app.doc.layers()[index].props.clone();
-                    app.doc.set_props_live(index, LayerProps { blend: BlendMode::ALL[(choice - 1) as usize], ..before.clone() });
+                    let props = match BlendMode::ALL.get((choice - 1) as usize) {
+                        Some(&blend) => LayerProps { blend, pass_through: false, ..before.clone() },
+                        None => LayerProps { blend: BlendMode::Normal, pass_through: true, ..before.clone() },
+                    };
+                    app.doc.set_props_live(index, props);
                     app.doc.commit_props(index, before);
                     app.document_changed();
                 }
@@ -2561,6 +2790,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     if ui::contains(&c, pt.x, pt.y) {
                         let z = app.view.zoom * WHEEL_STEP.powf(delta);
                         app.zoom_to(z, ((pt.x - c.left) as f32, (pt.y - c.top) as f32));
+                    } else if app.panels && ui::contains(&app.layout.layers, pt.x, pt.y) {
+                        // 图层列表上：一格滚两行。
+                        let rows = (delta * 2.0).round() as isize;
+                        app.layer_scroll = (app.layer_scroll as isize - rows).max(0) as usize;
+                        app.refresh_ui();
+                        // 滚过了头的部分不算，免得往回滚时要先空转几下。
+                        app.layer_scroll = app.layout.layer_first;
+                        // 拖着图层滚的时候，放到哪里跟着变。
+                        if let Some(Grab::Layer { moving: true, .. }) = app.grab {
+                            let mut at = POINT::default();
+                            let _ = GetCursorPos(&mut at);
+                            let _ = ScreenToClient(hwnd, &mut at);
+                            app.layer_drop = ui::drop_at(&app.doc, &app.layout, at.y, app.scale);
+                            app.refresh_ui();
+                        }
                     }
                 });
                 LRESULT(0)
@@ -2580,6 +2824,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     }
                     None => DefWindowProcW(hwnd, msg, wp, lp),
                 }
+            }
+            WM_INITMENUPOPUP => {
+                let menu = HMENU(wp.0 as *mut _);
+                if let Some(states) = with_app(|app| app.menu_states()) {
+                    for (id, on) in states {
+                        let _ = EnableMenuItem(menu, id as u32, MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED });
+                    }
+                }
+                LRESULT(0)
             }
             WM_KEYUP => {
                 with_app(|app| app.key_up(wp.0 as u16));
@@ -2636,6 +2889,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 菜单项（不算分隔线）不超过 60 个（实现方案的界面规模），编号不重复。
+    #[test]
+    fn menus_stay_small() {
+        let ids: Vec<u16> = MENUS.iter().flat_map(|m| m.2.iter()).map(|i| i.0).filter(|&id| id != 0).collect();
+        assert!(ids.len() <= 60, "{} 个菜单项", ids.len());
+        for (k, id) in ids.iter().enumerate() {
+            assert!(!ids[..k].contains(id), "编号 {id} 重复");
         }
     }
 }

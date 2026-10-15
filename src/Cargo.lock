@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "zhibi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "windows",
  "zhibi-core",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "zhibi-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "png",
  "serde_json",

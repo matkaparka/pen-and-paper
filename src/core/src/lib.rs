@@ -14,6 +14,7 @@ pub mod psd;
 pub mod selection;
 pub mod stabilizer;
 pub mod stroke;
+pub mod style;
 pub mod tile;
 pub mod transform;
 pub mod view;

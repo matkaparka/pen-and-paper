@@ -843,6 +843,34 @@ fn pixels(t: &Tile) -> Option<&[u16; LEN]> {
     t.0.as_slice().try_into().ok()
 }
 
+/// 新算出来的分块只在 `clip`（画布）里算数：分块伸出 `clip` 的那部分换回原来的像素。
+/// 液化、滤镜只改画布里的，画布外的内容原样不动（实现方案 §3.15）。
+pub fn keep_outside(new: Option<Arc<Tile>>, old: Option<&Arc<Tile>>, tc: TileCoord, clip: Rect) -> Option<Arc<Tile>> {
+    let inside = tile_rect_in(tc, clip);
+    let whole = Rect { x0: tc.0 * TILE, y0: tc.1 * TILE, x1: (tc.0 + 1) * TILE, y1: (tc.1 + 1) * TILE };
+    // 长度不对的分块当作不存在；原样没动的分块照旧共用。
+    let Some(old) = old.filter(|o| o.0.len() == N * 4) else { return new };
+    if inside == whole || new.as_ref().is_some_and(|n| Arc::ptr_eq(n, old)) {
+        return new;
+    }
+    if inside.is_empty() {
+        return Some(old.clone());
+    }
+    let outside = |x: i32, y: i32| x < inside.x0 || x >= inside.x1 || y < inside.y0 || y >= inside.y1;
+    let index = |x: i32, y: i32| (((y - whole.y0) * TILE + (x - whole.x0)) * 4) as usize;
+    let pixels = || (whole.y0..whole.y1).flat_map(move |y| (whole.x0..whole.x1).map(move |x| (x, y))).filter(|&(x, y)| outside(x, y));
+    // 原来的分块伸出去的那部分是空的，就没有要留的。
+    if pixels().all(|(x, y)| old.0[index(x, y) + 3] == 0) {
+        return new;
+    }
+    let mut t = new.as_deref().filter(|n| n.0.len() == N * 4).cloned().unwrap_or_else(Tile::new);
+    for (x, y) in pixels() {
+        let k = index(x, y);
+        t.0[k..k + 4].copy_from_slice(&old.0[k..k + 4]);
+    }
+    visible(&t.0).then(|| Arc::new(t))
+}
+
 fn visible(data: &[u16]) -> bool {
     data.as_chunks::<4>().0.iter().any(|p| p[3] != 0)
 }
