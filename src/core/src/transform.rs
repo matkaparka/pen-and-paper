@@ -871,6 +871,43 @@ pub fn keep_outside(new: Option<Arc<Tile>>, old: Option<&Arc<Tile>>, tc: TileCoo
     visible(&t.0).then(|| Arc::new(t))
 }
 
+/// 把 `top` 盖在 `base` 上：正常模式的覆盖，预乘，out = top + base·(1 − top.α)（导入到当前图层，实现方案 §3.19）。
+/// `keep_alpha`（保护不透明度）时每个像素的透明度保持 `base` 的，颜色取覆盖之后的颜色。
+/// 只有 `top` 有内容的分块要算，别的分块和 `base` 共用。
+pub fn cover(base: &TileMap, top: &TileMap, keep_alpha: bool) -> TileMap {
+    let mut out = base.clone();
+    for tc in top.coords() {
+        let Some(src) = top.get(tc).filter(|t| t.0.len() == LEN && visible(&t.0)) else { continue };
+        let under = base.get(tc).filter(|t| t.0.len() == LEN);
+        if under.is_none() {
+            // 底下是空的：保护不透明度时什么也落不上，否则就是 `top` 本身。
+            if !keep_alpha {
+                out.replace(tc, Some(src.clone()));
+            }
+            continue;
+        }
+        let dst = out.get_mut(tc);
+        for (d, s) in dst.0.as_chunks_mut::<4>().0.iter_mut().zip(src.0.as_chunks::<4>().0) {
+            let sa = s[3] as u32;
+            if sa == 0 {
+                continue;
+            }
+            let inv = ONE - sa.min(ONE);
+            let over = |c: usize| (s[c] as u32 + ((d[c] as u32 * inv + ONE / 2) >> 15)).min(ONE);
+            let o = [over(0), over(1), over(2), over(3)];
+            if keep_alpha {
+                let a = d[3] as u32;
+                // 按透明度换算回去：颜色 ≤ 透明度，换算后仍 ≤ a。
+                let back = |c: u32| if o[3] == 0 { 0 } else { ((c as u64 * a as u64 + o[3] as u64 / 2) / o[3] as u64) as u16 };
+                *d = [back(o[0]), back(o[1]), back(o[2]), a as u16];
+            } else {
+                *d = o.map(|v| v as u16);
+            }
+        }
+    }
+    out
+}
+
 fn visible(data: &[u16]) -> bool {
     data.as_chunks::<4>().0.iter().any(|p| p[3] != 0)
 }
@@ -1507,5 +1544,35 @@ mod tests {
             let (fast, best) = (millis(&src, &m, Quality::Fast, clip), millis(&src, &m, Quality::Best, clip));
             eprintln!("[{profile}] {name}：Fast {fast:.2} ms，Best {best:.2} ms");
         }
+    }
+
+    /// 导入到当前图层：盖上去、保护不透明度、底下空的分块（实现方案 §3.19）。
+    #[test]
+    fn covering_puts_the_picture_over_the_layer() {
+        let one = ONE as u16;
+        let tile_of = |px: [u16; 4]| {
+            let mut m = TileMap::default();
+            m.get_mut((0, 0)).0[..4].copy_from_slice(&px);
+            m
+        };
+        let first = |m: &TileMap, tc: TileCoord| m.get(tc).map(|t| [t.0[0], t.0[1], t.0[2], t.0[3]]);
+        let white = tile_of([one; 4]);
+        // 半透明的蓝盖在白上：一半白一半蓝，不透明。
+        let out = cover(&white, &tile_of([0, 0, H, H]), false);
+        assert_eq!(first(&out, (0, 0)), Some([H, H, one, one]));
+        // 保护不透明度：底下是半透明的红，盖上不透明的蓝，透明度还是一半。
+        let red = tile_of([H, 0, 0, H]);
+        let out = cover(&red, &tile_of([0, 0, one, one]), true);
+        assert_eq!(first(&out, (0, 0)), Some([0, 0, H, H]));
+        // 底下没有的分块：普通时直接是那张图，保护不透明度时什么都不落。
+        let mut top = tile_of([0, 0, one, one]);
+        top.get_mut((3, 2)).0[..4].copy_from_slice(&[one; 4]);
+        assert_eq!(first(&cover(&white, &top, false), (3, 2)), Some([one; 4]));
+        assert!(cover(&white, &top, true).get((3, 2)).is_none());
+        // 图没有盖到的分块和原来共用。
+        let mut wide = white.clone();
+        wide.get_mut((5, 5)).0[0] = 7;
+        let out = cover(&wide, &tile_of([0, 0, one, one]), false);
+        assert!(Arc::ptr_eq(out.get((5, 5)).unwrap(), wide.get((5, 5)).unwrap()));
     }
 }

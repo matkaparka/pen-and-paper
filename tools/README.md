@@ -129,6 +129,16 @@ powershell -ExecutionPolicy Bypass -File idle.ps1 -Seconds 90 -Timeout 600
 - `run-mini.sh <exe> <X,Y,W,H> <输出目录>`：精简测试集（延迟和平滑），9 条笔画，用来在同一程序里扫某个参数。
 - `python summarize.py <输出目录>...`：把一个或多个输出目录汇总成表。
 
+## filedlg.ps1：填系统的文件对话框（配合 bg）
+
+```
+powershell -ExecutionPolicy Bypass -File filedlg.ps1 [-ProcessName zhibi-test] (-Path 完整路径 [-Replace] | -Cancel) [-Kind N]
+```
+
+`bg` 用 `postcmd:` 打开"打开 / 另存为 / 导出 / 导入"之后，用它等对话框出来，打印标题、默认的文件名和选着的文件类型，再把文件名填进去按"确定"（`-Cancel` 是取消）。`-Replace` 在系统问"是否替换"时答"是"，`-Kind N` 先选第 N 种文件类型。全靠窗口消息（`WM_SETTEXT`、`WM_COMMAND`、`TDM_CLICK_BUTTON`），不动指针、不按键盘。
+
+为什么不用 UI 自动化：这种对话框下半截的文件名框、类型框、按钮在 UI 自动化里只是没有模式的"窗格"，设不了值；它们是真正的子窗口，发消息可以。另存为对话框的文件名框埋得深（`Edit` 1001 在一个没有编号的 `ComboBox` 里），类型框没有编号，脚本按"不是装着文件名的那个 `ComboBox`"去找。对话框开着的时候，`bg` 找到的"程序的窗口"是对话框，这时发给主窗口的 `postcmd` 会落空。
+
 ## appstat.ps1：启动耗时与空闲内存
 
 ```

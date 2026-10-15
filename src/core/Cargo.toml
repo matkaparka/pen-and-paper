@@ -6,9 +6,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# 写 JPEG（实现方案 §3.19）。没有别的依赖；许可证是 MIT 或 Apache-2.0，外加正向 DCT 那一段的 IJG 条款
+#（要在随附文档里声明"部分基于独立 JPEG 组的工作"，写在 README 里）。
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"] }
 png = "0.17"
 serde_json = "1"
 # 只要 deflate。`deflate-flate2` 本身不选压缩后端，用的是 png 已经带进来的
 # flate2 默认后端（纯 Rust 的 miniz_oxide），所以不会多出别的压缩库。
 # 版本定在 8.6：9.0 是 2026-10-09 才发布的大版本，等它稳定一阵再升。
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+# 读 JPEG。纯 Rust，只多带一个 zune-core；MIT、Apache-2.0、Zlib 三选一。0.5.16 还是预发布版，先用 0.5.15。
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std", "x86"] }

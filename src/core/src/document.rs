@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! 文档：画布尺寸、图层、撤销栈，以及把图层合成为可显示的像素。
 
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -57,6 +55,18 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
+    /// 下面五种是参照软件自己特有的（规格 F-146，实现方案 §3.21）：颜色按"这一层的透明度乘不透明度"直接加减到底色上，
+    /// 不像 PS 的模式那样先混合再按透明度过渡。只在读它的文件时出现，混合模式的下拉表里没有。
+    /// 底色 + 源色 × 透明度
+    Brighten,
+    /// 底色 − (1 − 源色) × 透明度
+    Dim,
+    /// 底色 + (2 × 源色 − 1) × 透明度
+    BrightenDim,
+    /// 底色 ÷ (1 − 源色 × 透明度)
+    SoftDodge,
+    /// 1 − (1 − 底色) ÷ (1 − (1 − 源色) × 透明度)
+    SoftBurn,
 }
 
 impl BlendMode {
@@ -89,6 +99,9 @@ impl BlendMode {
         BlendMode::Color,
         BlendMode::Luminosity,
     ];
+
+    /// 参照软件特有的五种（不在下拉表里）。
+    pub const EXTRA: [BlendMode; 5] = [BlendMode::Brighten, BlendMode::Dim, BlendMode::BrightenDim, BlendMode::SoftDodge, BlendMode::SoftBurn];
 
     /// 每组的第一个：下拉表在它们前面画分隔线。
     pub const GROUP_STARTS: [BlendMode; 5] = [BlendMode::Darken, BlendMode::Lighten, BlendMode::Overlay, BlendMode::Difference, BlendMode::Hue];
@@ -123,6 +136,11 @@ impl BlendMode {
             Saturation => tr("饱和度", "Saturation"),
             Color => tr("颜色", "Color"),
             Luminosity => tr("明度", "Luminosity"),
+            Brighten => tr("提亮", "Brighten"),
+            Dim => tr("压暗", "Dim"),
+            BrightenDim => tr("提亮/压暗", "Brighten/Dim"),
+            SoftDodge => tr("柔和减淡", "Soft Dodge"),
+            SoftBurn => tr("柔和加深", "Soft Burn"),
         }
     }
 
@@ -156,11 +174,64 @@ impl BlendMode {
             Saturation => "saturation",
             Color => "color",
             Luminosity => "luminosity",
+            Brighten => "brighten",
+            Dim => "dim",
+            BrightenDim => "brighten-dim",
+            SoftDodge => "soft-dodge",
+            SoftBurn => "soft-burn",
         }
     }
 
     pub fn from_id(id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|m| m.id() == id)
+        Self::ALL.into_iter().chain(Self::EXTRA).find(|m| m.id() == id)
+    }
+
+    /// 存成别的格式时用的模式：参照软件特有的五种换成 PS 里最接近的（PS、ORA 里没有它们），别的不变。
+    pub fn nearest_standard(self) -> BlendMode {
+        use BlendMode::*;
+        match self {
+            Brighten => Add,
+            Dim => LinearBurn,
+            BrightenDim => LinearLight,
+            SoftDodge => ColorDodge,
+            SoftBurn => ColorBurn,
+            other => other,
+        }
+    }
+
+    /// 参照软件特有的那五种：混合时要用到源的透明度（见 `blend`）。
+    fn by_alpha(self) -> bool {
+        Self::EXTRA.contains(&self)
+    }
+
+    /// 参照软件特有的五种在底色不透明时的结果（非预乘，0..=ONE）：b 底色，s 源色，a 源的透明度乘不透明度。
+    fn mix_by_alpha(self, b: u32, s: u32, a: u32) -> u32 {
+        use BlendMode::*;
+        let (b, s, a) = (b as i64, s as i64, a as i64);
+        let one = ONE as i64;
+        let v = match self {
+            Brighten => b + s * a / one,
+            Dim => b - (one - s) * a / one,
+            BrightenDim => b + (2 * s - one) * a / one,
+            SoftDodge => {
+                let d = one - s * a / one;
+                if d <= 0 {
+                    if b > 0 { one } else { 0 }
+                } else {
+                    b * one / d
+                }
+            }
+            SoftBurn => {
+                let d = one - (one - s) * a / one;
+                if d <= 0 {
+                    if b >= one { one } else { 0 }
+                } else {
+                    one - (one - b) * one / d
+                }
+            }
+            _ => s,
+        };
+        v.clamp(0, one) as u32
     }
 
     /// 逐个分量算的模式（色相、饱和度、颜色、明度、深色、浅色要三个分量一起算）。
@@ -252,6 +323,8 @@ impl BlendMode {
             // s = 0 时：b 也是 0 就是 0，否则是 1。
             Divide => (b * ONE).checked_div(s).map_or(if b == 0 { 0 } else { ONE }, |q| q.min(ONE)),
             Hue | Saturation | Color | Luminosity | DarkerColor | LighterColor => s,
+            // 这五种要用到透明度，在 `blend` 里另外算。
+            Brighten | Dim | BrightenDim | SoftDodge | SoftBurn => s,
         }
     }
 
@@ -279,6 +352,12 @@ impl BlendMode {
 pub static FILL_MODEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FILL_PS);
 /// 校准后定下来的作用。
 pub const FILL_PS: u8 = 2;
+
+/// 剪贴组的合成方法（实现方案 §3.22），校准时换着试：0 每个剪贴的图层直接叠在下面合好的画面上（乘底的透明度）；
+/// 1 底的混合模式不是正常、或不透明度不到 100% 时，底和剪贴的先单独合成再叠下去，否则同 0；2 总是先单独合成。
+pub static CLIP_MODEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(CLIP_DEFAULT);
+/// 平时用的方法。
+pub const CLIP_DEFAULT: u8 = 2;
 
 /// PS 里填充不透明度起作用方式不同的那几种模式，和它们"不起作用"的颜色（拿这个颜色混合，结果就是底色）。
 fn neutral(mode: BlendMode) -> Option<u32> {
@@ -1181,6 +1260,38 @@ impl Document {
         self.mask_target = self.mask_target && self.active == before && self.layers[self.active].mask.is_some();
     }
 
+    /// 最近一个撤销步骤的编号（没有时是 None）。导入时用它认出自己加的那一步。
+    pub fn last_step(&self) -> Option<u64> {
+        self.undo.last().map(|s| s.id)
+    }
+
+    /// 最近两步里前一步的编号是 `first` 时，把这两步并成一步（导入为新图层：加图层、放像素，规格 F-148）。
+    /// 中间夹了别的步骤就不并，各自照样能撤销。返回并了没有。
+    pub fn join_last_two(&mut self, first: u64) -> bool {
+        let n = self.undo.len();
+        if n < 2 || self.undo[n - 2].id != first {
+            return false;
+        }
+        let (Some(second), Some(earlier)) = (self.undo.pop(), self.undo.pop()) else { return false };
+        // 撤销时先撤后一步、再撤前一步（`Group` 倒着来），当前图层回到前一步之前的那个；编号用后一步的，保存点不受影响。
+        let selection = match (earlier.selection, second.selection) {
+            (Some(s), _) | (None, Some(s)) => Some(s),
+            (None, None) => None,
+        };
+        self.undo.push(Step { id: second.id, action: Action::Group(vec![earlier.action, second.action]), active: earlier.active, selection });
+        true
+    }
+
+    /// 最近一步的编号是 `id` 时撤销它，而且不留重做（导入为新图层后又取消了，规格 F-148）。返回撤了没有。
+    pub fn forget_last(&mut self, id: u64) -> bool {
+        if self.last_step() != Some(id) {
+            return false;
+        }
+        self.undo();
+        self.redo.pop();
+        true
+    }
+
     /// 撤销一步，返回需要重画的画布区域。
     pub fn undo(&mut self) -> Rect {
         let Some(mut step) = self.undo.pop() else { return Rect::EMPTY };
@@ -1213,18 +1324,22 @@ impl Document {
     /// `stroke` 是正在画、尚未并入的那一笔，叠在当前图层（或它的蒙版）上。
     fn accumulate(&self, tc: TileCoord, acc: &mut [[u32; 4]], pick: impl Fn(usize) -> bool, stroke: Option<&Stroke>) {
         let live = Live::new(self, tc, stroke);
-        self.level(tc, acc, 0..self.layers.len(), &pick, &live);
+        self.level(tc, acc, 0..self.layers.len(), &pick, &live, false);
     }
 
     /// 把 `range` 里最外层的兄弟（连同文件夹里面的东西）自下而上叠到 `acc` 上（实现方案 §3.11）。
     /// 一个文件夹里面的东西，就是排在它前面、上一个兄弟后面的那一串。
-    fn level(&self, tc: TileCoord, acc: &mut [[u32; 4]], range: std::ops::Range<usize>, pick: &dyn Fn(usize) -> bool, live: &Live) {
+    /// `onto_base` 时这一串是剪贴组里穿透的组的内容（实现方案 §3.22）：每一层都按 source-atop 叠，透明度不变。
+    fn level(&self, tc: TileCoord, acc: &mut [[u32; 4]], range: std::ops::Range<usize>, pick: &dyn Fn(usize) -> bool, live: &Live, onto_base: bool) {
         let Some(depth) = self.layers[range.clone()].iter().map(|l| l.depth).min() else { return };
         let siblings: Vec<usize> = range.clone().filter(|&i| self.layers[i].depth == depth).collect();
         // 剪贴图层的遮罩：它下面最近的那个不剪贴的兄弟（它的"底"）在这个分块上各像素的不透明度。
         // 空着表示底在这里没有内容，剪贴在它上面的图层也就什么都不显示。
         let mut base_alpha: Vec<u16> = Vec::new();
         let mut base_shown = false;
+        // 剪贴组（实现方案 §3.22）：底和剪贴在它上面的图层先在一块透明的底板上合成——底用正常模式、不透明度 100%，
+        // 剪贴的图层按 source-atop——再按底的混合模式和不透明度叠到下面。这里是那块底板和底是第几层。
+        let mut group: Option<(Vec<[u32; 4]>, usize)> = None;
         let mut from = range.start;
         for (k, &li) in siblings.iter().enumerate() {
             let children = from..li;
@@ -1232,6 +1347,9 @@ impl Document {
             let layer = &self.layers[li];
             let clipped = layer.props.clip && k > 0;
             if !clipped {
+                if let Some((buf, base)) = group.take() {
+                    self.flush_clip_group(acc, &buf, base, onto_base);
+                }
                 base_shown = pick(li);
                 base_alpha.clear();
             }
@@ -1256,20 +1374,38 @@ impl Document {
             let opacity = (layer.props.opacity.clamp(0.0, 1.0) * ONE as f32) as u32;
             let fill = (layer.props.fill.clamp(0.0, 1.0) * ONE as f32).round() as u32;
             let mask = self.mask_values(li, tc, live);
+            let pass = layer.is_folder() && layer.props.pass_through && board.is_none();
+            // 底（穿透的组除外）开一块底板；底自己在底板上按正常模式、不透明度 100% 画，剪贴的按 source-atop。
+            let as_group = match CLIP_MODEL.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => false,
+                1 => layer.props.blend != BlendMode::Normal || opacity < ONE,
+                _ => true,
+            };
+            if feeds && !pass && as_group {
+                group = Some((vec![[0u32; 4]; N], li));
+            }
+            // 叠到底板上的剪贴图层、剪贴组里穿透的组的内容：source-atop。没有底板时剪贴的图层乘底的透明度。
+            let atop = if group.is_some() { clipped } else { onto_base };
+            let mask_by_base = clipped && group.is_none();
+            let (mode, opacity) = if group.is_some() && !clipped { (BlendMode::Normal, ONE) } else { (layer.props.blend, opacity) };
+            let target: &mut [[u32; 4]] = match group.as_mut() {
+                Some((buf, _)) => buf,
+                None => acc,
+            };
 
-            if layer.is_folder() && layer.props.pass_through && board.is_none() {
+            if pass {
                 // 穿透：里面的东西直接叠在一份拷贝上，再按不透明度（乘蒙版、剪贴）在原来和拷贝之间过渡。
-                let mut copy = acc.to_vec();
-                self.level(tc, &mut copy, children.clone(), pick, live);
+                let mut copy = target.to_vec();
+                self.level(tc, &mut copy, children.clone(), pick, live, atop);
                 if feeds {
                     // 当底用的是它里面合出来的透明度，这要另外按隔离的方式合一遍。
                     let mut alone = vec![[0u32; 4]; N];
-                    self.level(tc, &mut alone, children, pick, live);
+                    self.level(tc, &mut alone, children, pick, live, false);
                     base_alpha = (0..N).map(|i| within_mask(alone[i][3] as u16, mask.as_deref(), i)).collect();
                 }
-                for (i, (dst, c)) in acc.iter_mut().zip(&copy).enumerate() {
+                for (i, (dst, c)) in target.iter_mut().zip(&copy).enumerate() {
                     let mut f = within_mask(opacity as u16, mask.as_deref(), i) as u32;
-                    if clipped {
+                    if mask_by_base {
                         f = mul15(f, base_alpha[i] as u32);
                     }
                     if f != 0 {
@@ -1300,7 +1436,7 @@ impl Document {
                             }
                         }
                     }
-                    self.level(tc, &mut sub, children, pick, live);
+                    self.level(tc, &mut sub, children, pick, live, false);
                     if let Some((r, _)) = board {
                         for (i, p) in sub.iter_mut().enumerate() {
                             if !inside(i, r) {
@@ -1330,7 +1466,7 @@ impl Document {
                     let a = mul15(v as u32, (e.opacity.clamp(0.0, 1.0) * ONE as f32) as u32);
                     [mul15(to15(e.color[0]), a) as u16, mul15(to15(e.color[1]), a) as u16, mul15(to15(e.color[2]), a) as u16, a as u16]
                 };
-                for (i, dst) in acc.iter_mut().enumerate() {
+                for (i, dst) in target.iter_mut().enumerate() {
                     let mut out = *dst;
                     for (e, t) in fx.iter().filter(|(e, _)| e.below()) {
                         if t[i] != 0 {
@@ -1353,7 +1489,7 @@ impl Document {
                     }
                     px = with_fill(px, fill, layer.props.blend);
                     if px[3] != 0 {
-                        out = blend(out, px, ONE, layer.props.blend);
+                        out = blend(out, px, ONE, mode);
                     }
                     for (e, t) in fx.iter().filter(|(e, _)| !e.below()) {
                         if t[i] != 0 {
@@ -1379,15 +1515,15 @@ impl Document {
             }
             // 最常见的情况（普通图层，没有蒙版、剪贴、填充，也不在画它）单走一条不带分支的路。
             let plain = fill >= ONE && (layer.props.shapes || neutral(layer.props.blend).is_none());
-            if let (None, Some(t), false, None, false, false, true) = (&own, tile, painting, &mask, feeds, clipped, plain) {
-                for (dst, p) in acc.iter_mut().zip(t.0.as_chunks::<4>().0) {
+            if let (None, Some(t), false, None, false, false, true, false) = (&own, tile, painting, &mask, feeds, clipped, plain, atop) {
+                for (dst, p) in target.iter_mut().zip(t.0.as_chunks::<4>().0) {
                     if p[3] != 0 {
-                        *dst = blend(*dst, *p, opacity, layer.props.blend);
+                        *dst = blend(*dst, *p, opacity, mode);
                     }
                 }
                 continue;
             }
-            for (i, dst) in acc.iter_mut().enumerate() {
+            for (i, dst) in target.iter_mut().enumerate() {
                 let mut px = match (&own, tile) {
                     (Some(o), _) => o[i],
                     (None, Some(t)) => [t.0[i * 4], t.0[i * 4 + 1], t.0[i * 4 + 2], t.0[i * 4 + 3]],
@@ -1408,26 +1544,43 @@ impl Document {
                     base_alpha[i] = px[3];
                 }
                 // 透明形状图层关着：底下不透明时，按整块铺满来混合（剪贴的铺满剪贴的底）。
-                if dst[3] >= ONE {
+                // 剪贴组的底板上，"底下"就是底：底有内容的地方都算。
+                if dst[3] >= ONE || (atop && dst[3] > 0) {
                     if let Some(mut full) = shapeless(px, fill, layer.props.blend, layer.props.shapes) {
-                        if clipped {
+                        if mask_by_base {
                             let a = base_alpha[i] as u32;
                             full = full.map(|v| mul15(v as u32, a) as u16);
                         }
                         if full[3] != 0 {
-                            *dst = blend(*dst, full, opacity, layer.props.blend);
+                            *dst = if atop { blend_atop(*dst, full, opacity, mode) } else { blend(*dst, full, opacity, mode) };
                         }
                         continue;
                     }
                 }
                 px = with_fill(px, fill, layer.props.blend);
-                if clipped {
+                if mask_by_base {
                     let a = base_alpha[i] as u32;
                     px = px.map(|v| mul15(v as u32, a) as u16);
                 }
                 if px[3] != 0 {
-                    *dst = blend(*dst, px, opacity, layer.props.blend);
+                    *dst = if atop { blend_atop(*dst, px, opacity, mode) } else { blend(*dst, px, opacity, mode) };
                 }
+            }
+        }
+        if let Some((buf, base)) = group.take() {
+            self.flush_clip_group(acc, &buf, base, onto_base);
+        }
+    }
+
+    /// 剪贴组合好的底板（实现方案 §3.22）按底的混合模式和不透明度叠到 `acc` 上。
+    /// `atop` 时这个剪贴组本身在别的剪贴组里，也按 source-atop 叠。
+    fn flush_clip_group(&self, acc: &mut [[u32; 4]], buf: &[[u32; 4]], base: usize, atop: bool) {
+        let props = &self.layers[base].props;
+        let opacity = (props.opacity.clamp(0.0, 1.0) * ONE as f32) as u32;
+        for (dst, p) in acc.iter_mut().zip(buf) {
+            if p[3] != 0 {
+                let p = p.map(|v| v.min(ONE) as u16);
+                *dst = if atop { blend_atop(*dst, p, opacity, props.blend) } else { blend(*dst, p, opacity, props.blend) };
             }
         }
     }
@@ -1494,14 +1647,31 @@ impl Document {
         rgb
     }
 
+    /// 整张画布合成后的 RGBA 像素（每通道 8 位、非预乘，逐行），底下不垫背景色：没画到的地方是透明的
+    ///（"PNG（透明背景）"，实现方案 §3.19）。
+    pub fn flatten_rgba(&self) -> Vec<u8> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        let mut acc = vec![[0u32; 4]; N];
+        for tc in tiles_in(self.bounds()) {
+            acc.fill([0; 4]);
+            self.accumulate(tc, &mut acc, |i| self.layers[i].props.visible, None);
+            let r = tile_rect(tc).intersect(self.bounds());
+            for y in r.y0..r.y1 {
+                for x in r.x0..r.x1 {
+                    let a = acc[((y - tc.1 * TILE) * TILE + (x - tc.0 * TILE)) as usize];
+                    let px = crate::ora::shared::to_straight8(a.map(|v| v.min(ONE) as u16));
+                    let o = (y as usize * w + x as usize) * 4;
+                    rgba[o..o + 4].copy_from_slice(&px);
+                }
+            }
+        }
+        rgba
+    }
+
     /// 把整张画布合成后导出为 PNG（不透明，RGB 各 8 位）。
     pub fn export_png(&self, path: &Path) -> std::io::Result<()> {
-        let rgb = self.flatten_rgb();
-        let mut enc = png::Encoder::new(BufWriter::new(File::create(path)?), self.width as u32, self.height as u32);
-        enc.set_color(png::ColorType::Rgb);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut wr = enc.write_header().map_err(std::io::Error::other)?;
-        wr.write_image_data(&rgb).map_err(std::io::Error::other)
+        crate::image::export_png(self, path, false)
     }
 }
 
@@ -1632,6 +1802,17 @@ fn blend(dst: [u32; 4], src: [u16; 4], opacity: u32, mode: BlendMode) -> [u32; 4
     let mut out = [0u32; 4];
     out[3] = (sa + mul15(da, ONE - sa)).min(ONE);
     let alpha = out[3];
+    // 参照软件特有的五种：底不透明时结果是 R（见 `mix_by_alpha`）；底透明的部分照常把源盖上去：
+    // 颜色 = 源色 × 透明度 × (1 − 底的透明度) + R × 底的透明度（底半透明时的做法是推想的，没有对照过）。
+    if mode.by_alpha() && da != 0 {
+        let s = [0, 1, 2].map(|c| (src[c] as u32 * ONE / src[3] as u32).min(ONE));
+        for (c, o) in out.iter_mut().take(3).enumerate() {
+            let b = (dst[c] * ONE / da).min(ONE);
+            let v = mul15(mul15(s[c], sa), ONE - da) + mul15(mode.mix_by_alpha(b, s[c], sa), da);
+            *o = v.min(alpha);
+        }
+        return out;
+    }
     // 混合公式要用非预乘的颜色。
     let mixed = if mode == BlendMode::Normal || da == 0 {
         [0; 3]
@@ -1655,6 +1836,38 @@ fn blend(dst: [u32; 4], src: [u16; 4], opacity: u32, mode: BlendMode) -> [u32; 4
         // 预乘像素的颜色不能超过它的透明度。几项各自四舍五入后加起来可能多出 1，这里压回去；
         // 否则这种像素存不进"非预乘"的文件格式，存盘再读回会差一点。
         *o = v.min(alpha);
+    }
+    out
+}
+
+/// 同 `blend`，但结果的透明度保持底的（source-atop）：剪贴组里剪贴的图层这样叠在底上（实现方案 §3.22）。
+#[inline]
+fn blend_atop(dst: [u32; 4], src: [u16; 4], opacity: u32, mode: BlendMode) -> [u32; 4] {
+    let sa = mul15(src[3] as u32, opacity);
+    let da = dst[3];
+    if sa == 0 || da == 0 {
+        return dst;
+    }
+    let s = [0, 1, 2].map(|c| (src[c] as u32 * ONE / src[3] as u32).min(ONE));
+    let b = [0, 1, 2].map(|c| (dst[c] * ONE / da).min(ONE));
+    let mut out = [0u32; 4];
+    out[3] = da;
+    if mode.by_alpha() {
+        for c in 0..3 {
+            out[c] = mul15(mode.mix_by_alpha(b[c], s[c], sa), da).min(da);
+        }
+        return out;
+    }
+    let mixed = if mode == BlendMode::Normal {
+        s
+    } else if mode.separable() {
+        [0, 1, 2].map(|c| mode.mix(b[c], s[c]))
+    } else {
+        mode.mix3(b, s)
+    };
+    // 两者重叠处的混合色 + 底独占的部分；源独占的部分（底透明处）不要。
+    for c in 0..3 {
+        out[c] = (mul15(mul15(sa, da), mixed[c]) + mul15(dst[c], ONE - sa)).min(da);
     }
     out
 }

@@ -29,7 +29,8 @@
 - **画布外的内容**：伸出画布的部分不裁掉，存回去照样有，移动、变换时跟着走。
 - **画板**：PS 的画板读进来是一个组，背景色和范围照样画，存回 PSD 还是画板。
 - **视图**：以光标为中心缩放、旋转、镜像，按住空格平移。
-- **文件**：自己的格式 `.zhibi`（压缩包里是 JSON 和逐层 PNG，每通道 15 位精度）；PSD、ORA 的打开和导出，文件夹、蒙版、填充图层都保留（ORA 没有蒙版和填充图层，导出时画进像素）；导出 PNG。
+- **文件**：自己的格式 `.zhibi`（压缩包里是 JSON 和逐层 PNG，每通道 15 位精度）；PSD、ORA 能打开、另存为、导出，文件夹、蒙版、填充图层都保留（ORA 没有蒙版和填充图层，导出时画进像素）。PNG、JPEG 能打开（照片的拍摄方向会转正），能导出（PNG 可以选透明背景）。另外能打开 PaintTool SAI Ver.2 的 `.sai2` 文件（只读：图层、组、蒙版、剪贴、混合模式都读进来，存的时候存成别的格式）。
+- **导入图片**："文件 → 导入为新图层…"或"导入到当前图层…"，把 PNG、JPEG 放进来，先在画布中间（太大就缩到放得下），可以直接移动、缩放、旋转、扭曲，回车确定。
 - **其他**：快捷键可以改；按住工具键画一笔再松开是临时借用这个工具；笔身按键切到橡皮时自动换成橡皮；Windows 笔输入和 Wintab 都支持；中文、英文界面。
 
 ### 系统要求与安装
@@ -72,6 +73,8 @@ Windows 10 或 11，64 位。编译好的程序在 [Releases](https://github.com
 
 GPL-3.0-or-later，见 [LICENSE](LICENSE)。
 
+用到的第三方库都是宽松的许可证（MIT、Apache-2.0、Zlib 这一类）。写 JPEG 用的 `jpeg-encoder` 里有一段来自独立 JPEG 组的代码，按它的条款在此声明：本软件部分基于独立 JPEG 组（Independent JPEG Group）的工作。
+
 ---
 
 ## English
@@ -95,7 +98,8 @@ Pen & Paper does one thing: drawing and painting — sketching, inking and colou
 - **Content outside the canvas** is kept, saved back, and follows the layer when you move or transform it.
 - **Artboards** from Photoshop become groups that keep the artboard's background colour and bounds, and stay artboards when saved back to PSD.
 - **View**: zoom at the cursor, rotate, mirror, hold Space to pan.
-- **Files**: own format `.zhibi` (a ZIP with JSON and one PNG per layer, 15 bits per channel); open and export PSD and ORA, keeping folders, masks and fill layers (ORA has no masks or fill layers, so those are painted into the pixels on export); export PNG.
+- **Files**: own format `.zhibi` (a ZIP with JSON and one PNG per layer, 15 bits per channel); open, save as and export PSD and ORA, keeping folders, masks and fill layers (ORA has no masks or fill layers, so those are painted into the pixels on export). Open PNG and JPEG (photos are turned upright) and export them (PNG optionally with a transparent background). Also opens PaintTool SAI Ver.2 `.sai2` files (read only: layers, groups, masks, clipping and blend modes come in; save to another format).
+- **Import pictures**: *File → Import as New Layer…* or *Import into Current Layer…* brings in a PNG or JPEG, centred on the canvas (scaled down if it's too big), ready to move, scale, rotate or distort; press Enter to place it.
 - **More**: customizable shortcuts; hold a tool key, draw, release to borrow a tool for one stroke; switches to the eraser when the pen's button flips it to eraser mode; Windows Ink and Wintab pen input; Chinese and English interface.
 
 ### Requirements and building
@@ -137,3 +141,5 @@ All keys can be changed in *Edit → Keyboard Shortcuts…*.
 ### License
 
 GPL-3.0-or-later, see [LICENSE](LICENSE).
+
+The third-party libraries used are all under permissive licences (MIT, Apache-2.0, Zlib and the like). The JPEG writer, `jpeg-encoder`, contains code from the Independent JPEG Group; as its terms require: this software is based in part on the work of the Independent JPEG Group.

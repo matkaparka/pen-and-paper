@@ -184,6 +184,8 @@ pub const ACTIONS: &[Action] = &[
     action("save", "保存", "Save", Cmd::Save, "Ctrl+S"),
     action("save_as", "另存为", "Save As", Cmd::SaveAs, "Ctrl+Shift+S"),
     action("export", "导出", "Export", Cmd::Export, "Ctrl+Shift+E"),
+    action("import_layer", "导入为新图层", "Import as New Layer", Cmd::ImportLayer, ""),
+    action("import_into", "导入到当前图层", "Import into Current Layer", Cmd::ImportInto, ""),
 ];
 
 /// 当前的键位：与 `ACTIONS` 一一对应。

@@ -7,7 +7,7 @@
 //! 像素每次都从进入变换时存下的原图重新算，所以来回拖多少次都不会越拖越糊。
 //!
 //! 变换的对象是当前图层的像素和蒙版；当前是文件夹时，是里面所有图层的像素和蒙版（实现方案 §3.11、§3.12），
-//! 都用同一个变换。
+//! 都用同一个变换。导入的图片（规格 F-148，实现方案 §3.19）也走这里：它浮在图层上面变换，确定时才落进去。
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
@@ -70,31 +70,48 @@ struct Grab {
     offset: (f32, f32),
 }
 
-/// 变换的一样东西：某一层的像素，或者它的蒙版（画成"墨"，见 `Mask::to_ink`）。
+/// 变换的一样东西：某一层的像素，或者它的蒙版（画成"墨"，见 `Mask::to_ink`），或者导入的一张图。
 pub struct Piece {
     pub layer: usize,
     /// 是蒙版的话，原来的蒙版（变完照它的默认值、停用与否做回蒙版）
     pub mask: Option<Mask>,
-    /// 进入变换时的像素（蒙版是它的墨）
+    /// 进入变换时的像素（蒙版是它的墨；导入时是那张图）
     pub orig: TileMap,
+    /// 导入时图层原来的像素：变换好的图盖在它上面（实现方案 §3.19）
+    pub base: Option<Base>,
+}
+
+/// 导入的图盖在哪些像素上。
+pub struct Base {
+    pub tiles: TileMap,
+    /// 图层"保护不透明度"：盖上去以后透明度不变
+    pub keep_alpha: bool,
 }
 
 impl Piece {
     /// 变换后的像素（墨）做成要换进文档的东西。
     pub fn part(&self, tiles: TileMap) -> Part {
-        match &self.mask {
-            Some(m) => Part::Mask(Some(m.with_ink(&tiles))),
-            None => Part::Pixels(tiles),
+        match (&self.mask, &self.base) {
+            (Some(m), _) => Part::Mask(Some(m.with_ink(&tiles))),
+            (None, Some(b)) => Part::Pixels(transform::cover(&b.tiles, &tiles, b.keep_alpha)),
+            (None, None) => Part::Pixels(tiles),
         }
     }
 
     /// 进入变换之前的样子。
     pub fn original(&self) -> Part {
-        match &self.mask {
-            Some(m) => Part::Mask(Some(m.clone())),
-            None => Part::Pixels(self.orig.clone()),
+        match (&self.mask, &self.base) {
+            (Some(m), _) => Part::Mask(Some(m.clone())),
+            (None, Some(b)) => Part::Pixels(b.tiles.clone()),
+            (None, None) => Part::Pixels(self.orig.clone()),
         }
     }
+}
+
+/// 进行中的导入（规格 F-148）。
+pub struct Import {
+    /// 导入为新图层时，加进那个图层的是哪一个撤销步骤：确定时和放进像素的那一步并成一步，取消时拿掉它
+    pub new_layer: Option<u64>,
 }
 
 pub struct Xform {
@@ -120,6 +137,10 @@ pub struct Xform {
     pub stale: bool,
     /// 拖一下就确认（移动工具），不显示外框和手柄
     pub quick: bool,
+    /// 导入图片时有：确定时就算没动过也要落进图层，选区不跟着动
+    pub import: Option<Import>,
+    /// "复位"回到的位置：进入变换时的样子（导入的图是放在画布中间、缩到放得下的样子）
+    home: Params,
     grab: Option<Grab>,
 }
 
@@ -140,10 +161,10 @@ impl Xform {
                 continue;
             }
             if l.is_pixels() {
-                pieces.push(Piece { layer: i, mask: None, orig: l.tiles.clone() });
+                pieces.push(Piece { layer: i, mask: None, orig: l.tiles.clone(), base: None });
             }
             if let Some(m) = &l.mask {
-                pieces.push(Piece { layer: i, mask: Some(m.clone()), orig: m.to_ink() });
+                pieces.push(Piece { layer: i, mask: Some(m.clone()), orig: m.to_ink(), base: None });
             }
         }
         let sel = doc.selection().cloned();
@@ -160,23 +181,42 @@ impl Xform {
         Some(Xform::over(pieces, sel, rect, quick))
     }
 
+    /// 导入一张图（规格 F-148，实现方案 §3.19）：`picture` 的左上角在 (0, 0)，大小是 `size`，变换后落到第 `layer` 层，
+    /// 盖在 `base` 上。开始时放在画布中间；比画布大时等比缩小到正好放得下。
+    pub fn import(picture: TileMap, size: (i32, i32), layer: usize, base: Base, canvas: Rect, import: Import) -> Xform {
+        let rect = Rect { x0: 0, y0: 0, x1: size.0, y1: size.1 };
+        let piece = Piece { layer, mask: None, orig: picture, base: Some(base) };
+        let mut x = Xform::over(vec![piece], None, rect, false);
+        let (cw, ch) = ((canvas.x1 - canvas.x0) as f32, (canvas.y1 - canvas.y0) as f32);
+        let fit = (cw / size.0 as f32).min(ch / size.1 as f32).min(1.0);
+        x.center = ((canvas.x0 + canvas.x1) as f32 / 2.0, (canvas.y0 + canvas.y1) as f32 / 2.0);
+        x.scale = (fit, fit);
+        // 不缩放时对到整像素上，原样照搬，不经过插值。
+        x.snap();
+        x.home = x.params();
+        x.import = Some(import);
+        x.stale = true;
+        x
+    }
+
     fn over(pieces: Vec<Piece>, sel: Option<Selection>, rect: Rect, quick: bool) -> Xform {
-        let mut x = Xform {
+        let home = Params { center: ((rect.x0 + rect.x1) as f32 / 2.0, (rect.y0 + rect.y1) as f32 / 2.0), scale: (1.0, 1.0), angle: 0.0 };
+        Xform {
             pieces,
             sel,
             rect,
-            center: (0.0, 0.0),
-            scale: (1.0, 1.0),
-            angle: 0.0,
+            center: home.center,
+            scale: home.scale,
+            angle: home.angle,
             mode: Mode::Free,
             warp: [(0.0, 0.0); 4],
             mesh: [(0.0, 0.0); POINTS],
             stale: false,
             quick,
+            import: None,
+            home,
             grab: None,
-        };
-        x.center = x.origin();
-        x
+        }
     }
 
     /// 外框变换前的中心。
@@ -440,9 +480,7 @@ impl Xform {
 
     /// 回到进入变换时的样子：位置、扭曲、网格都清掉。
     pub fn reset(&mut self) {
-        self.center = self.origin();
-        self.scale = (1.0, 1.0);
-        self.angle = 0.0;
+        (self.center, self.scale, self.angle) = (self.home.center, self.home.scale, self.home.angle);
         self.warp = [(0.0, 0.0); 4];
         self.mesh = [(0.0, 0.0); POINTS];
         self.stale = true;
@@ -618,7 +656,7 @@ mod tests {
                 t.0[i..i + 4].copy_from_slice(&[ONE as u16; 4]);
             }
         }
-        Xform::over(vec![Piece { layer: 0, mask: None, orig: tiles }], None, r, false)
+        Xform::over(vec![Piece { layer: 0, mask: None, orig: tiles, base: None }], None, r, false)
     }
 
     fn alpha(tiles: &TileMap, x: i32, y: i32) -> u32 {
@@ -863,5 +901,62 @@ mod tests {
         x.drag((120.0, 200.0), false);
         let c = x.matrix().apply(80.0, 70.0);
         assert!(close(x.mesh_point(5), c), "{:?} {c:?}", x.mesh_point(5));
+    }
+
+    /// 一张 w×h 的不透明的图，左上角在 (0, 0)，颜色是 `px`。
+    fn picture(w: i32, h: i32, px: [u16; 4]) -> TileMap {
+        let mut tiles = TileMap::default();
+        for y in 0..h {
+            for x in 0..w {
+                let t = tiles.get_mut((x.div_euclid(TILE), y.div_euclid(TILE)));
+                let i = (y.rem_euclid(TILE) * TILE + x.rem_euclid(TILE)) as usize * 4;
+                t.0[i..i + 4].copy_from_slice(&px);
+            }
+        }
+        tiles
+    }
+
+    fn empty_base() -> Base {
+        Base { tiles: TileMap::default(), keep_alpha: false }
+    }
+
+    /// 导入的图（规格 F-148）：放在画布中间；比画布大时等比缩到正好放得下；"复位"回到这个位置。
+    #[test]
+    fn an_imported_picture_starts_centred_and_fitted() {
+        let canvas = Rect { x0: 0, y0: 0, x1: 200, y1: 120 };
+        let one = ONE as u16;
+        let mut big = Xform::import(picture(400, 200, [one; 4]), (400, 200), 0, empty_base(), canvas, Import { new_layer: None });
+        let c = big.corners();
+        assert!(close(c[0], (0.0, 10.0)) && close(c[2], (200.0, 110.0)), "{c:?}");
+        assert!(big.stale && !big.is_identity());
+        big.grab(Handle::Move, (100.0, 60.0));
+        big.drag((130.0, 70.0), false);
+        big.reset();
+        assert!(close(big.corners()[0], (0.0, 10.0)));
+        // 比画布小的：原大，落在整像素上（宽高是奇数也一样），不插值。
+        let small = Xform::import(picture(51, 31, [one; 4]), (51, 31), 0, empty_base(), canvas, Import { new_layer: None });
+        let c = small.corners();
+        assert!(close(c[0], (75.0, 45.0)) && close(c[2], (126.0, 76.0)), "{c:?}");
+        let out = small.render(Quality::Best, canvas).remove(0);
+        assert_eq!((alpha(&out, 75, 45), alpha(&out, 125, 75), alpha(&out, 74, 45), alpha(&out, 126, 75)), (ONE, ONE, 0, 0));
+    }
+
+    /// 导入到当前图层：变换好的图盖在图层原来的像素上；取消时就是原来的像素。
+    #[test]
+    fn an_imported_picture_lands_on_the_layer() {
+        let canvas = Rect { x0: 0, y0: 0, x1: 128, y1: 64 };
+        let one = ONE as u16;
+        let base = Base { tiles: picture(128, 64, [one; 4]), keep_alpha: false };
+        let x = Xform::import(picture(10, 10, [one, 0, 0, one]), (10, 10), 3, base, canvas, Import { new_layer: None });
+        let p = &x.pieces[0];
+        let Part::Pixels(done) = p.part(x.render(Quality::Best, canvas).remove(0)) else { panic!("应是像素") };
+        let px = |t: &TileMap, xx: i32, yy: i32| {
+            let i = (yy.rem_euclid(TILE) * TILE + xx.rem_euclid(TILE)) as usize * 4;
+            let tile = t.get((xx.div_euclid(TILE), yy.div_euclid(TILE))).unwrap();
+            [tile.0[i], tile.0[i + 1], tile.0[i + 2], tile.0[i + 3]]
+        };
+        assert_eq!((p.layer, px(&done, 64, 32), px(&done, 10, 10)), (3, [one, 0, 0, one], [one; 4]));
+        let Part::Pixels(back) = p.original() else { panic!("应是像素") };
+        assert_eq!(px(&back, 64, 32), [one; 4]);
     }
 }

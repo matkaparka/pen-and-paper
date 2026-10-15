@@ -64,7 +64,7 @@ const MAX_PNG_SIDE: u32 = 2 * MAX_SIDE as u32;
 const MAX_INTERLACED_BYTES: usize = 1 << 30;
 /// 图层在画布上的偏移量夹到这个范围里，后面的加减法就不会溢出。
 const MAX_OFFSET: i64 = 1 << 40;
-const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+pub(crate) const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// 混合模式在 `stack.xml` 里的名字（`composite-op` 属性）。
 /// 规范里没有的模式（线性加深、亮光、线性光、点光、实色混合、减去、划分、深色、浅色）导出时写成普通覆盖。
@@ -89,6 +89,7 @@ const COMPOSITE_OPS: [(BlendMode, &str); 17] = [
 ];
 
 fn composite_op(mode: BlendMode) -> &'static str {
+    let mode = mode.nearest_standard();
     COMPOSITE_OPS.iter().find(|(m, _)| *m == mode).map_or("svg:src-over", |(_, op)| op)
 }
 
@@ -341,8 +342,8 @@ pub fn load(path: &Path) -> io::Result<(Document, Vec<String>)> {
                 notes.layer(tr("下列图层的图像不是 PNG，已跳过", "Skipped layers whose image is not a PNG"), name);
                 continue;
             }
-            PngOutcome::Read { clipped: true } => notes.layer(shared::clipped_kind(), name),
-            PngOutcome::Read { clipped: false } => {}
+            PngOutcome::Read { clipped: true, .. } => notes.layer(shared::clipped_kind(), name),
+            PngOutcome::Read { clipped: false, .. } => {}
         }
         if let Some(op) = &entry.unknown_op {
             notes.layer(shared::unknown_blend_kind(), &trf!("{name}（{op:.40}）", "{name} ({op:.40})"));
@@ -596,15 +597,14 @@ fn parse_offset(v: &str) -> Option<i64> {
     Some(n.clamp(-MAX_OFFSET, MAX_OFFSET))
 }
 
-enum PngOutcome {
-    /// 压缩包里有这个文件，但它不是 PNG
+pub(crate) enum PngOutcome {
+    /// 有这个文件，但它不是 PNG
     NotPng,
-    /// 读进来了。`clipped` 表示有看得见的像素落在画布之外，被裁掉了
-    Read { clipped: bool },
+    /// 读进来了。`clipped` 表示有看得见的像素落在 `keep` 之外，被裁掉了；`dpi` 是文件里 `pHYs` 记着的分辨率
+    Read { clipped: bool, dpi: Option<u32> },
 }
 
-/// 把压缩包里的一张图层图像解码进 `tiles`。`offset` 是它的左上角在画布上的位置，伸出 `keep`
-/// （图层能放到的范围）的部分裁掉。8 位和 16 位的灰度、灰度加透明度、RGB、RGBA 以及调色板图像都能读。
+/// 把压缩包里的一张图层图像解码进 `tiles`，`offset`、`keep` 见 `decode_png`（`keep` 是图层能放到的范围）。
 fn read_layer_png<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
     src: &str,
@@ -612,11 +612,17 @@ fn read_layer_png<R: Read + Seek>(
     keep: Rect,
     tiles: &mut TileMap,
 ) -> io::Result<PngOutcome> {
-    let mut entry = match zip.by_name(src) {
+    let entry = match zip.by_name(src) {
         Ok(entry) => entry,
         Err(ZipError::FileNotFound) => return Err(invalid(tr("不在压缩包里", "not in the archive"))),
         Err(e) => return Err(invalid(trf!("无法读取：{e}", "could not read: {e}"))),
     };
+    decode_png(entry, offset, keep, tiles)
+}
+
+/// 把一张 PNG 解码进 `tiles`（ORA 的图层图像、单独的 PNG 文件都走这里）。`offset` 是它的左上角在画布上的位置，
+/// 伸出 `keep` 的部分裁掉。8 位和 16 位的灰度、灰度加透明度、RGB、RGBA 以及调色板图像都能读。
+pub(crate) fn decode_png(mut entry: impl Read, offset: (i64, i64), keep: Rect, tiles: &mut TileMap) -> io::Result<PngOutcome> {
     // 先自己读文件头：8 个字节的签名，紧跟着是 IHDR 数据块，图像的宽和高在固定的位置上。
     // 知道了尺寸才好给后面的读取量设上限，免得一个很小的压缩包解出没完没了的数据。
     let mut head = [0u8; 33];
@@ -651,6 +657,7 @@ fn read_layer_png<R: Read + Seek>(
     let decode_error = |e: png::DecodingError| invalid(trf!("无法解码：{e}", "could not decode: {e}"));
     let mut reader = decoder.read_info().map_err(decode_error)?;
     let interlaced = reader.info().interlaced;
+    let dpi = reader.info().pixel_dims.and_then(|d| png_dpi(d.xppu, d.unit));
     if (reader.info().width, reader.info().height) != (width, height) {
         return Err(invalid(tr("无法解码：文件头不对", "could not decode: bad header")));
     }
@@ -716,7 +723,21 @@ fn read_layer_png<R: Read + Seek>(
         // 再要一行，让解码器把剩下的图像数据读完：数据块的校验和在块的末尾，读到那里才会核对。
         reader.next_row().map_err(decode_error)?;
     }
-    Ok(PngOutcome::Read { clipped })
+    Ok(PngOutcome::Read { clipped, dpi })
+}
+
+/// `pHYs` 里的像素密度换成每英寸多少像素。单位不是米（只记了长宽比）或者换算出来不像样时返回 None。
+fn png_dpi(per_unit: u32, unit: png::Unit) -> Option<u32> {
+    let dpi = match unit {
+        png::Unit::Meter => (per_unit as f64 * 0.0254).round() as u32,
+        png::Unit::Unspecified => return None,
+    };
+    (1..=65535).contains(&dpi).then_some(dpi)
+}
+
+/// 每英寸多少像素换成 `pHYs` 用的每米多少像素。
+pub(crate) fn png_pixels_per_meter(dpi: u32) -> u32 {
+    (dpi as f64 / 0.0254).round() as u32
 }
 
 /// 把解码出来的一行换成 16 位、非预乘的 RGBA。每个像素有 `samples` 个采样（1 灰度、2 灰度加透明度、

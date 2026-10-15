@@ -321,7 +321,9 @@ pub fn build(app: &App, client: (i32, i32)) -> Layout {
     let selected = app.doc.selection().is_some();
 
     if let Some(x) = app.xform_shown() {
-        label(&mut items, &mut y, tr("自由变换", "Free Transform").into());
+        // 导入图片（规格 F-148）也走自由变换，标题说明这是在放导入的图。
+        let title = if x.import.is_some() { tr("放置导入的图片", "Place Imported Picture") } else { tr("自由变换", "Free Transform") };
+        label(&mut items, &mut y, title.into());
         label(&mut items, &mut y, trf!("宽 {:.0}%　高 {:.0}%　转 {:.1}°", "W {:.0}%  H {:.0}%  {:.1}°", x.scale.0.abs() * 100.0, x.scale.1.abs() * 100.0, x.angle.to_degrees()));
         // 宽、高、角度说的只是外框的位置；做过扭曲或网格变形的，另起一行注明。
         let extra = match (x.warped(), x.bent()) {

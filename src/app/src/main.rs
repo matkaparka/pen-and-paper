@@ -39,8 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use keys::{Key, Keymap};
 use ui::{Kind, Layout, Popup, SliderId};
-use xform::{Handle, Mode, Xform};
-use zhibi_core::document::{BlendMode, Document, Kind as LayerKind, LayerProps, Part, MAX_SIDE};
+use xform::{Base, Handle, Mode, Xform};
+use zhibi_core::document::{BlendMode, Document, Kind as LayerKind, Layer, LayerProps, Part, MAX_SIDE};
 use zhibi_core::fill::{self, FillOptions, Source};
 use zhibi_core::filter::{self, Adjust};
 use zhibi_core::liquify::{self, Liquify};
@@ -51,7 +51,7 @@ use zhibi_core::stroke::{BrushParams, Stroke};
 use zhibi_core::transform::Quality;
 use zhibi_core::view::{Display, View};
 use zhibi_core::lang::{self, tr};
-use zhibi_core::{format, ora, psd, trf, Rect};
+use zhibi_core::{format, image, ora, psd, sai2, trf, Rect};
 
 /// 笔刷大小预设表（规格 F-015）。方括号键在表里上下移动。
 pub const SIZES: &[f32] = &[
@@ -188,6 +188,9 @@ impl Tool {
 pub enum Cmd {
     New,
     Open,
+    /// 导入图片为新图层、导入到当前图层（规格 F-148）
+    ImportLayer,
+    ImportInto,
     Save,
     SaveAs,
     Export,
@@ -373,6 +376,9 @@ const MENUS: &[(&str, &str, &[MenuItem])] = &[
             (101, "新建…", "New…", Cmd::New),
             (102, "打开…", "Open…", Cmd::Open),
             (0, "", "", Cmd::Exit),
+            (107, "导入为新图层…", "Import as New Layer…", Cmd::ImportLayer),
+            (108, "导入到当前图层…", "Import into Current Layer…", Cmd::ImportInto),
+            (0, "", "", Cmd::Exit),
             (103, "保存", "Save", Cmd::Save),
             (104, "另存为…", "Save As…", Cmd::SaveAs),
             (105, "导出…", "Export…", Cmd::Export),
@@ -533,8 +539,11 @@ pub struct App {
     pub font: HFONT,
     pub doc: Document,
     path: Option<PathBuf>,
-    /// `path` 是导入的 PSD 或 ORA。这时"保存"要另起一个我们自己格式的文件名，不去覆盖原文件。
+    /// `path` 是打开进来的别的格式的文件（PSD、ORA、参照软件的格式、PNG、JPEG），这次还没存过。这时"保存"先出"另存为"，
+    /// 不悄悄覆盖原文件（实现方案 §3.20）。
     foreign: bool,
+    /// 打开的 PNG 里有透明的像素：导出时默认选"PNG（透明背景）"
+    transparent_source: bool,
     display: Display,
     pub view: View,
     back: Option<Backbuffer>,
@@ -1299,12 +1308,76 @@ impl App {
         for p in &x.pieces {
             self.set_part_live(p.layer, p.original());
         }
-        self.doc.set_selection(x.sel.clone());
-        if keep && !x.is_identity() {
-            let parts = x.pieces.iter().zip(x.render(Quality::Best, area)).map(|(p, t)| (p.layer, p.part(t))).collect();
-            self.doc.replace_parts(parts, x.moved_selection(canvas).map(Some));
+        let render = |x: &Xform| x.pieces.iter().zip(x.render(Quality::Best, area)).map(|(p, t)| (p.layer, p.part(t))).collect::<Vec<_>>();
+        match &x.import {
+            None => {
+                self.doc.set_selection(x.sel.clone());
+                if keep && !x.is_identity() {
+                    self.doc.replace_parts(render(&x), x.moved_selection(canvas).map(Some));
+                }
+            }
+            // 导入的图（规格 F-148）：没动过也落进去，选区不动。导入为新图层时，加图层和放像素并成一个撤销步骤；
+            // 取消时把加的图层撤掉。中间改过别的（例如这个图层的不透明度）就并不成、撤不掉，那样照常各记各的。
+            Some(import) => {
+                if keep {
+                    self.doc.replace_parts(render(&x), None);
+                    if let Some(step) = import.new_layer {
+                        self.doc.join_last_two(step);
+                    }
+                } else if let Some(step) = import.new_layer {
+                    if !self.doc.forget_last(step) {
+                        self.doc.set_active(x.pieces[0].layer);
+                        self.doc.remove_active();
+                    }
+                }
+            }
         }
         self.document_changed();
+    }
+
+    /// "导入到当前图层"为什么用不了（规格 F-148）；用得了时是 None。
+    fn import_blocked(&self) -> Option<&'static str> {
+        let a = self.doc.active();
+        if !self.doc.layers()[a].is_pixels() {
+            Some(tr(
+                "当前图层是组或填充图层，图片放不进去。可以用“导入为新图层”。",
+                "The current layer is a group or a fill layer, so a picture can\u{2019}t go into it. Use Import as New Layer instead.",
+            ))
+        } else if self.doc.is_locked(a) {
+            Some(tr("当前图层（或它所在的组）锁定着，解锁之后才能导入进去。", "The layer or its group is locked. Unlock it to import into it."))
+        } else if self.doc.mask_target() {
+            Some(tr("正在画蒙版。点图层的名字回到画像素，再导入。", "You are painting on the mask. Click the layer name to go back to its pixels, then import."))
+        } else {
+            None
+        }
+    }
+
+    /// 导入一张图（规格 F-148，实现方案 §3.19）：放进当前图层上面的新图层，或者盖在当前图层上，随即进入自由变换。
+    /// 新图层落在锁定的组里时不导入，返回原因。
+    fn begin_import(&mut self, picture: image::Picture, name: &str, into: bool) -> Option<&'static str> {
+        let size = (picture.width, picture.height);
+        let (layer, base, new_layer) = if into {
+            let a = self.doc.active();
+            let l = &self.doc.layers()[a];
+            (a, Base { tiles: l.tiles.clone(), keep_alpha: l.props.lock_alpha }, None)
+        } else {
+            let index = self.doc.add_layer_with(Layer::new(name));
+            let step = self.doc.last_step();
+            if self.doc.is_locked(index) {
+                if let Some(step) = step {
+                    self.doc.forget_last(step);
+                }
+                self.document_changed();
+                return Some(tr(
+                    "新图层会放进锁定着的组里。解锁那个组，或者先选组外面的图层。",
+                    "The new layer would go into a locked group. Unlock the group or select a layer outside it first.",
+                ));
+            }
+            (index, Base { tiles: TileMap::default(), keep_alpha: false }, step)
+        };
+        self.xform = Some(Xform::import(picture.tiles, size, layer, base, self.doc.bounds(), xform::Import { new_layer }));
+        self.document_changed();
+        None
     }
 
     /// 预览时把某一层的像素或者蒙版换掉（不记撤销）。
@@ -1511,7 +1584,7 @@ impl App {
         let centre = (vp.0 as f32 / 2.0, vp.1 as f32 / 2.0);
         let bounds = self.doc.bounds();
         match cmd {
-            Cmd::New | Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Export | Cmd::Exit | Cmd::Shortcuts | Cmd::PenWintab => {
+            Cmd::New | Cmd::Open | Cmd::ImportLayer | Cmd::ImportInto | Cmd::Save | Cmd::SaveAs | Cmd::Export | Cmd::Exit | Cmd::Shortcuts | Cmd::PenWintab => {
                 return Some(Later::Run(cmd))
             }
             Cmd::PenPointer => {
@@ -2060,6 +2133,7 @@ impl App {
             (701, filters),
             (702, filters),
             (703, filters),
+            (108, self.import_blocked().is_none()),
             (316, l.mask.is_none() && !self.doc.is_locked(self.doc.active())),
             (317, l.mask.is_some() && l.is_pixels() && !self.doc.is_locked(self.doc.active())),
         ]
@@ -2206,12 +2280,26 @@ fn knob(buf: &mut [u32], stride: usize, origin: (i32, i32), clip: Rect, c: (f32,
     }
 }
 
-/// 按扩展名读文件。返回文档、读入时要告诉用户的话（哪些内容没能照原样读进来），以及它是不是我们自己的格式。
-fn load_any(path: &Path) -> std::io::Result<(Document, Vec<String>, bool)> {
+/// 读进来的一个文件。
+struct Opened {
+    doc: Document,
+    /// 读入时要告诉用户的话（哪些内容没能照原样读进来）
+    notes: Vec<String>,
+    /// 是我们自己的格式
+    native: bool,
+    /// 是有透明像素的 PNG
+    transparent: bool,
+}
+
+/// 按扩展名读文件。
+fn load_any(path: &Path) -> std::io::Result<Opened> {
+    let other = |(doc, notes)| Opened { doc, notes, native: false, transparent: false };
     match extension(path).as_str() {
-        "psd" => psd::load(path).map(|(doc, notes)| (doc, notes, false)),
-        "ora" => ora::load(path).map(|(doc, notes)| (doc, notes, false)),
-        _ => format::load(path).map(|doc| (doc, Vec::new(), true)),
+        "psd" => psd::load(path).map(other),
+        "ora" => ora::load(path).map(other),
+        "sai2" => sai2::load(path).map(other),
+        "png" | "jpg" | "jpeg" => image::load(path).map(|(doc, transparent)| Opened { doc, notes: Vec::new(), native: false, transparent }),
+        _ => format::load(path).map(|doc| Opened { doc, notes: Vec::new(), native: true, transparent: false }),
     }
 }
 
@@ -2240,17 +2328,36 @@ fn extension(path: &Path) -> String {
 
 fn open_filter() -> &'static str {
     tr(
-        "能打开的文件 (*.zhibi;*.psd;*.ora)\0*.zhibi;*.psd;*.ora\0纸笔画布 (*.zhibi)\0*.zhibi\0\0",
-        "Supported files (*.zhibi;*.psd;*.ora)\0*.zhibi;*.psd;*.ora\0Pen & Paper canvas (*.zhibi)\0*.zhibi\0\0",
+        "能打开的文件 (*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg)\0*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg\0纸笔画布 (*.zhibi)\0*.zhibi\0Photoshop 文件 (*.psd)\0*.psd\0SAI Ver.2 画布 (*.sai2，只读)\0*.sai2\0图片 (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0",
+        "Supported files (*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg)\0*.zhibi;*.psd;*.sai2;*.ora;*.png;*.jpg;*.jpeg\0Pen & Paper canvas (*.zhibi)\0*.zhibi\0Photoshop file (*.psd)\0*.psd\0SAI Ver.2 canvas (*.sai2, read only)\0*.sai2\0Images (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0",
     )
 }
 
-fn export_filter() -> &'static str {
+/// 导入图片的文件类型。
+fn image_filter() -> &'static str {
+    tr("图片 (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0", "Images (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0")
+}
+
+/// "另存为"能选的分层格式（实现方案 §3.20），和 `save_filter` 里的顺序一样。
+const SAVE_KINDS: [&str; 3] = [format::EXTENSION, psd::EXTENSION, ora::EXTENSION];
+
+fn save_filter() -> &'static str {
     tr(
-        "PNG 图像 (*.png)\0*.png\0Photoshop 文件 (*.psd)\0*.psd\0OpenRaster 文件 (*.ora)\0*.ora\0\0",
-        "PNG image (*.png)\0*.png\0Photoshop file (*.psd)\0*.psd\0OpenRaster file (*.ora)\0*.ora\0\0",
+        "纸笔画布 (*.zhibi)\0*.zhibi\0Photoshop 文件 (*.psd)\0*.psd\0OpenRaster 文件 (*.ora)\0*.ora\0\0",
+        "Pen & Paper canvas (*.zhibi)\0*.zhibi\0Photoshop file (*.psd)\0*.psd\0OpenRaster file (*.ora)\0*.ora\0\0",
     )
 }
+
+/// "导出"的文件类型（规格 F-143）。第 2 种是不垫背景色的 PNG。
+fn export_filter() -> &'static str {
+    tr(
+        "PNG 图像 (*.png)\0*.png\0PNG 图像，透明背景 (*.png)\0*.png\0JPEG 图像 (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0Photoshop 文件 (*.psd)\0*.psd\0OpenRaster 文件 (*.ora)\0*.ora\0\0",
+        "PNG image (*.png)\0*.png\0PNG image, transparent background (*.png)\0*.png\0JPEG image (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0Photoshop file (*.psd)\0*.psd\0OpenRaster file (*.ora)\0*.ora\0\0",
+    )
+}
+
+/// 导出对话框里"PNG（透明背景）"是第几种。
+const EXPORT_TRANSPARENT_PNG: u32 = 2;
 
 fn build_menu(keymap: &Keymap) -> Option<HMENU> {
     unsafe {
@@ -2332,13 +2439,13 @@ fn main() -> Result<()> {
         }
         // 命令行带了文件名就直接打开它（双击文件、拖到程序图标上都走这里）。
         let arg = std::env::args_os().nth(1).map(PathBuf::from);
-        let (doc, path, foreign, notes) = match arg.as_ref().map(|p| load_any(p)) {
-            Some(Ok((doc, notes, native))) => (doc, arg, !native, notes),
+        let (doc, path, foreign, transparent_source, notes) = match arg.as_ref().map(|p| load_any(p)) {
+            Some(Ok(o)) => (o.doc, arg, !o.native, o.transparent, o.notes),
             Some(Err(e)) => {
                 dialogs::message(hwnd, &trf!("打不开这个文件：{e}", "Could not open the file: {e}"));
-                (Document::new(3000, 2000), None, false, Vec::new())
+                (Document::new(3000, 2000), None, false, false, Vec::new())
             }
-            None => (Document::new(3000, 2000), None, false, Vec::new()),
+            None => (Document::new(3000, 2000), None, false, false, Vec::new()),
         };
         let view = View { zoom: 1.0, angle: 0.0, flip: false, center: (1500.0, 1000.0) };
         let empty = RECT::default();
@@ -2350,6 +2457,7 @@ fn main() -> Result<()> {
                 doc,
                 path,
                 foreign,
+                transparent_source,
                 display: Display::default(),
                 view,
                 back: None,
@@ -2535,8 +2643,24 @@ unsafe fn on_mouse(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<Later
 
 // ---- 需要自己的消息循环的操作：都在放开应用状态之后做 ----
 
+/// 存成 `path`，格式看扩展名：`.psd`、`.ora`，别的都是我们自己的格式（实现方案 §3.20）。
 fn save_to(hwnd: HWND, path: PathBuf) -> bool {
-    let result = with_app(|app| format::save(&app.doc, &path));
+    let ext = extension(&path);
+    if image::EXTENSIONS.contains(&ext.as_str()) {
+        dialogs::message(
+            hwnd,
+            tr(
+                "PNG、JPEG 存不下图层，请用“文件 → 导出…”。\n“另存为”能存成纸笔画布、PSD 或 ORA。",
+                "PNG and JPEG can\u{2019}t hold layers; use File → Export… for them.\nSave As writes Pen & Paper canvas, PSD or ORA files.",
+            ),
+        );
+        return false;
+    }
+    let result = with_app(|app| match ext.as_str() {
+        "psd" => psd::save(&app.doc, &path),
+        "ora" => ora::save(&app.doc, &path),
+        _ => format::save(&app.doc, &path),
+    });
     match result {
         Some(Ok(())) => {
             with_app(|app| {
@@ -2560,8 +2684,15 @@ fn save(hwnd: HWND, ask_path: bool) -> bool {
     let path = match (current, ask_path || foreign) {
         (Some(p), false) => Some(p),
         (current, _) => {
-            let name = format!("{}.{}", stem(current.as_deref()), format::EXTENSION);
-            dialogs::file_dialog(hwnd, true, tr("纸笔画布 (*.zhibi)\0*.zhibi\0\0", "Pen & Paper canvas (*.zhibi)\0*.zhibi\0\0"), format::EXTENSION, &name)
+            // 原来是分层的格式（打开的 PSD、ORA，或者另存为过）就默认存回它，类型也照它；存回原文件要在系统的
+            // "是否替换"里确认一次。别的（新建的、打开的图片）默认纸笔画布，放在原来那个目录里。
+            let kind = current.as_deref().and_then(|p| SAVE_KINDS.iter().position(|k| *k == extension(p))).unwrap_or(0);
+            let name = match &current {
+                Some(p) if SAVE_KINDS.contains(&extension(p).as_str()) => p.clone(),
+                Some(p) => p.with_extension(format::EXTENSION),
+                None => PathBuf::from(format!("{}.{}", stem(None), format::EXTENSION)),
+            };
+            dialogs::pick_file(hwnd, true, save_filter(), SAVE_KINDS[kind], &name.to_string_lossy(), kind as u32 + 1).map(|(p, _)| p)
         }
     };
     path.is_some_and(|p| save_to(hwnd, p))
@@ -2584,11 +2715,12 @@ fn may_discard(hwnd: HWND) -> bool {
     }
 }
 
-fn replace_document(doc: Document, path: Option<PathBuf>, foreign: bool) {
+fn replace_document(doc: Document, path: Option<PathBuf>, foreign: bool, transparent_source: bool) {
     with_app(|app| {
         app.doc = doc;
         app.path = path;
         app.foreign = foreign;
+        app.transparent_source = transparent_source;
         app.stroke = None;
         app.xform = None;
         app.liquify = None;
@@ -2614,7 +2746,7 @@ fn run_later(hwnd: HWND, later: Later) {
             if let Some(n) = dialogs::new_canvas(hwnd, font, scale, MAX_SIDE) {
                 let mut doc = Document::new(n.width, n.height);
                 doc.dpi = n.dpi;
-                replace_document(doc, None, false);
+                replace_document(doc, None, false, false);
             }
         }
         Later::Run(Cmd::Open) => {
@@ -2623,9 +2755,9 @@ fn run_later(hwnd: HWND, later: Later) {
             }
             if let Some(path) = dialogs::file_dialog(hwnd, false, open_filter(), format::EXTENSION, "") {
                 match load_any(&path) {
-                    Ok((doc, notes, native)) => {
-                        replace_document(doc, Some(path), !native);
-                        tell_notes(hwnd, &notes);
+                    Ok(o) => {
+                        replace_document(o.doc, Some(path), !o.native, o.transparent);
+                        tell_notes(hwnd, &o.notes);
                     }
                     Err(e) => dialogs::message(hwnd, &trf!("打不开这个文件：{e}", "Could not open the file: {e}")),
                 }
@@ -2638,17 +2770,38 @@ fn run_later(hwnd: HWND, later: Later) {
             save(hwnd, true);
         }
         Later::Run(Cmd::Export) => {
-            let name = format!("{}.png", with_app(|app| stem(app.path.as_deref())).unwrap_or_default());
-            if let Some(path) = dialogs::file_dialog(hwnd, true, export_filter(), "png", &name) {
-                // 导出成哪种格式看文件名的扩展名。
+            let Some((current, transparent)) = with_app(|app| (app.path.clone(), app.transparent_source)) else { return };
+            // 默认放在当前文件旁边、同名的 PNG；打开的 PNG 里有透明像素时默认不垫背景色。
+            let name = current.map_or_else(|| PathBuf::from(format!("{}.png", stem(None))), |p| p.with_extension("png"));
+            let kind = if transparent { EXPORT_TRANSPARENT_PNG } else { 1 };
+            if let Some((path, kind)) = dialogs::pick_file(hwnd, true, export_filter(), "png", &name.to_string_lossy(), kind) {
+                // 导出成哪种格式看文件名的扩展名；同是 PNG，垫不垫背景色看选的类型。
                 let result = with_app(|app| match extension(&path).as_str() {
                     "psd" => psd::save(&app.doc, &path),
                     "ora" => ora::save(&app.doc, &path),
-                    _ => app.doc.export_png(&path),
+                    "jpg" | "jpeg" => image::export_jpeg(&app.doc, &path),
+                    _ => image::export_png(&app.doc, &path, kind == EXPORT_TRANSPARENT_PNG),
                 });
                 if let Some(Err(e)) = result {
                     dialogs::message(hwnd, &trf!("导出失败：{e}", "Export failed: {e}"));
                 }
+            }
+        }
+        Later::Run(cmd @ (Cmd::ImportLayer | Cmd::ImportInto)) => {
+            let into = cmd == Cmd::ImportInto;
+            if let Some(why) = with_app(|app| if into { app.import_blocked() } else { None }).flatten() {
+                dialogs::message(hwnd, why);
+                return;
+            }
+            let Some(path) = dialogs::file_dialog(hwnd, false, image_filter(), "png", "") else { return };
+            match image::read(&path) {
+                Ok(picture) => {
+                    let name = stem(Some(&path));
+                    if let Some(why) = with_app(|app| app.begin_import(picture, &name, into)).flatten() {
+                        dialogs::message(hwnd, why);
+                    }
+                }
+                Err(e) => dialogs::message(hwnd, &trf!("打不开这张图片：{e}", "Could not open the picture: {e}")),
             }
         }
         Later::Run(Cmd::Exit) => unsafe {
@@ -2969,11 +3122,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 mod tests {
     use super::*;
 
-    /// 菜单项（不算分隔线）不超过 60 个（实现方案的界面规模），编号不重复。
+    /// 菜单项（不算分隔线）不超过 62 个（实现方案的界面规模；0.4 为两种导入从 60 放宽，见功能列表 §18），编号不重复。
     #[test]
     fn menus_stay_small() {
         let ids: Vec<u16> = MENUS.iter().flat_map(|m| m.2.iter()).map(|i| i.0).filter(|&id| id != 0).collect();
-        assert!(ids.len() <= 60, "{} 个菜单项", ids.len());
+        assert!(ids.len() <= 62, "{} 个菜单项", ids.len());
         for (k, id) in ids.iter().enumerate() {
             assert!(!ids[..k].contains(id), "编号 {id} 重复");
         }

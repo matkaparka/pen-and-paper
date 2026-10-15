@@ -110,6 +110,7 @@ const BLEND_KEYS: [(BlendMode, &[u8; 4]); 26] = [
 ];
 
 fn blend_key(mode: BlendMode) -> &'static [u8; 4] {
+    let mode = mode.nearest_standard();
     BLEND_KEYS.iter().find(|(m, _)| *m == mode).map_or(b"norm", |(_, key)| key)
 }
 
@@ -3193,6 +3194,9 @@ pub(crate) mod tests {
     #[ignore]
     fn compare_with_merged() {
         let Some(path) = std::env::var_os("ZHIBI_PSD_COMPARE") else { return };
+        if let Some(m) = std::env::var("ZHIBI_CLIP_MODEL").ok().and_then(|v| v.parse().ok()) {
+            crate::document::CLIP_MODEL.store(m, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(m) = std::env::var("ZHIBI_FILL_MODEL").ok().and_then(|v| v.parse().ok()) {
             crate::document::FILL_MODEL.store(m, std::sync::atomic::Ordering::Relaxed);
         }

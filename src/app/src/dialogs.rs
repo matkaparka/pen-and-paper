@@ -35,6 +35,12 @@ pub fn wide(s: &str) -> Vec<u16> {
 
 /// 系统的打开 / 保存文件对话框。`filter` 形如 "说明\0*.ext\0\0"。
 pub fn file_dialog(owner: HWND, save: bool, filter: &str, ext: &str, name: &str) -> Option<PathBuf> {
+    pick_file(owner, save, filter, ext, name, 1).map(|(path, _)| path)
+}
+
+/// 同 `file_dialog`，另外指定一开始选着第几种文件类型（从 1 数，`filter` 里的顺序），并返回最后选的是第几种。
+/// `name` 可以带着目录，对话框就打开在那个目录里。没写扩展名时系统按选着的类型补上。
+pub fn pick_file(owner: HWND, save: bool, filter: &str, ext: &str, name: &str, kind: u32) -> Option<(PathBuf, u32)> {
     let mut file = [0u16; 1024];
     for (d, s) in file.iter_mut().zip(name.encode_utf16()) {
         *d = s;
@@ -48,6 +54,7 @@ pub fn file_dialog(owner: HWND, save: bool, filter: &str, ext: &str, name: &str)
         lpstrFile: PWSTR(file.as_mut_ptr()),
         nMaxFile: file.len() as u32,
         lpstrDefExt: PCWSTR(ext.as_ptr()),
+        nFilterIndex: kind.max(1),
         Flags: if save { OFN_OVERWRITEPROMPT } else { OFN_FILEMUSTEXIST },
         ..Default::default()
     };
@@ -62,7 +69,7 @@ pub fn file_dialog(owner: HWND, save: bool, filter: &str, ext: &str, name: &str)
         return None;
     }
     let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    Some(PathBuf::from(String::from_utf16_lossy(&file[..len])))
+    Some((PathBuf::from(String::from_utf16_lossy(&file[..len])), ofn.nFilterIndex))
 }
 
 /// 在屏幕坐标 `at` 处弹出一个菜单，返回选中项的编号；没选返回 None。

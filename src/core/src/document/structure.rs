@@ -107,6 +107,13 @@ impl Document {
         index
     }
 
+    /// 把现成的一层放在新建图层的位置上并选中它，一个撤销步骤（导入为新图层，规格 F-148）。返回它的位置。
+    pub fn add_layer_with(&mut self, mut layer: Layer) -> usize {
+        let (index, depth) = self.new_slot();
+        layer.depth = depth;
+        self.insert_layer(index, layer)
+    }
+
     /// 放进新文件夹（Ctrl+G）：在当前图层的位置建一个文件夹，把当前图层（连同它里面的东西）放进去。
     pub fn group_active(&mut self) -> usize {
         let r = self.subtree(self.active);
@@ -302,7 +309,7 @@ impl Document {
                 continue;
             }
             let mut acc = vec![base.unwrap_or([0; 4]); N];
-            self.level(tc, &mut acc, range.clone(), &pick, &live);
+            self.level(tc, &mut acc, range.clone(), &pick, &live, false);
             if acc.iter().all(|p| p[3] == 0) {
                 continue;
             }
@@ -382,11 +389,14 @@ impl Document {
                     sp = sp.map(|v| mul15(v as u32, m[i] as u32) as u16);
                 }
                 sp = with_fill(sp, upper_fill, src.props.blend);
-                if masked {
-                    let a = dp[3];
-                    sp = sp.map(|v| mul15(v as u32, a) as u16);
-                }
-                let px = if sp[3] != 0 { blend(dp, sp, opacity, src.props.blend) } else { dp };
+                // 剪贴的：和显示时一样按 source-atop 叠在下层上（实现方案 §3.22），透明度还是下层的。
+                let px = if sp[3] == 0 {
+                    dp
+                } else if masked {
+                    blend_atop(dp, sp, opacity, src.props.blend)
+                } else {
+                    blend(dp, sp, opacity, src.props.blend)
+                };
                 any |= px[3] != 0;
                 for c in 0..4 {
                     out[i * 4 + c] = px[c] as u16;
@@ -1241,6 +1251,43 @@ mod tests {
         // 深度乱写的（自下而上）：普通图层下面更深、一下子深好几层、最上面不是 0。
         let doc = doc_of(vec![solid("a", 3, RED, rect(0, 0, 10, 10)), solid("b", 2, RED, rect(0, 0, 10, 10)), folder("f", 5, true)]);
         assert_eq!(names(&doc), ["·a", "·b", "f"]);
+        assert_valid(&doc);
+    }
+
+    /// 导入为新图层（规格 F-148）：加图层和放像素并成一步；取消时撤掉而且不留重做；中间夹了别的步骤就不并。
+    #[test]
+    fn an_imported_layer_is_one_step_or_nothing() {
+        let mut doc = doc_of(vec![solid("底", 0, RED, rect(0, 0, 200, 120)), folder("组", 0, false)]);
+        doc.set_folder_open(1, true);
+        let before = (names(&doc), doc.active(), doc.undo_depth());
+        // 当前是展开的文件夹：新图层放进它里面。
+        let index = doc.add_layer_with(Layer::new("图"));
+        let step = doc.last_step().unwrap();
+        assert_eq!((index, names(&doc)), (1, vec!["底".to_string(), "·图".into(), "组".into()]));
+        doc.replace_parts(vec![(index, Part::Pixels(solid("x", 0, BLUE, rect(10, 10, 50, 50)).tiles))], None);
+        assert!(doc.join_last_two(step));
+        assert_eq!(doc.undo_depth(), before.2 + 1);
+        doc.undo();
+        assert_eq!((names(&doc), doc.active(), doc.undo_depth()), before);
+        doc.redo();
+        assert_eq!(doc.layers()[1].tiles.len(), 1);
+        assert_eq!(doc.active(), 1);
+        doc.undo();
+        // 取消：撤掉加的那一步，重做里也没有它。
+        let index = doc.add_layer_with(Layer::new("图"));
+        let step = doc.last_step().unwrap();
+        assert!(doc.forget_last(step));
+        assert_eq!((names(&doc), doc.active(), doc.undo_depth(), doc.can_redo()), (before.0.clone(), before.1, before.2, false));
+        assert!(!doc.is_modified());
+        // 中间夹了一步改属性：不并，也不能直接撤掉。
+        doc.add_layer_with(Layer::new("图"));
+        let step = doc.last_step().unwrap();
+        let p = doc.layers()[index].props.clone();
+        doc.set_props_live(index, LayerProps { opacity: 0.5, ..p.clone() });
+        doc.commit_props(index, p);
+        assert!(!doc.forget_last(step));
+        doc.replace_parts(vec![(index, Part::Pixels(TileMap::default()))], None);
+        assert!(!doc.join_last_two(step));
         assert_valid(&doc);
     }
 }
